@@ -2,11 +2,17 @@
 
     python -m laya_poc.build_data --out <data_dir> [--smoke] [--config <yaml>] [--pool <pool.parquet>]
                                   [--models laya laya_ml] [--init-tokenizer <abs ckpt dir>]
+                                  [--duckdb-memory 4GB] [--duckdb-threads N] [--duckdb-temp <dir>]
+                                  [--verify-frozen] [--write-manifest <json>]
 
 Without --pool the labelled pool is extracted from the gated FSQ release with DuckDB, using the
 token in $HF_TOKEN (never printed or written). Every state must fit EVERY listed model's exact
 state budget, so one data directory serves both checkpoints. Prints a short summary; full detail
 goes to <data_dir>/data_report.json.
+
+FULL mode (no --smoke) also sets every trap candidate aside before the splits (trap_candidates.csv),
+writes train.jsonl (clean train split, for the baselines), applies the Event headline rule and
+fingerprints the JSONL files; --verify-frozen fails unless they match config data.frozen_manifest.
 """
 from __future__ import annotations
 
@@ -16,7 +22,6 @@ import os
 import random
 import shutil
 import sys
-import time
 import traceback
 from collections import Counter
 from dataclasses import dataclass
@@ -25,23 +30,27 @@ from typing import Any, Callable, Sequence
 
 import pandas as pd
 
-from . import extract, labels
+from . import extract, freeze, labels, traps
 from .augment import augment_epoch
+from .build_report import data_report, headline, summary_lines
 from .config import load_config, project_root, split_spec
 from .io_utils import sha256_file, write_jsonl, write_sha256sums
 from .notice import FSQ_NOTICE_NAME, fsq_notice
-from .rows import assert_no_leakage, check_reject_rate, make_rows, records_from_split, stripped_rows
+from .rows import TRAIN_SPLIT, assert_no_leakage, check_reject_rate, make_rows, records_from_split, stripped_rows
 from .serialise import fits_from_counters, state_budget, token_counter
-from .splits import SPLIT_ORDER, make_splits
+from .splits import SPLIT_ORDER, make_splits_with_info
 
 EVAL_SPLITS = ("val", "test_id")
 OOD_SPLITS = ("ood_country", "ood_script", "ood_brand")
-STALE_PATTERNS = ("train_e*.jsonl", "ood_*.jsonl", "val.jsonl", "test_id.jsonl", "stripped_test.jsonl",
-                  "split_*.parquet", "data_report.json", "SHA256SUMS", "build_data_error.log", FSQ_NOTICE_NAME)
+STALE_PATTERNS = ("train_e*.jsonl", "train.jsonl", "ood_*.jsonl", "val.jsonl", "test_id.jsonl",
+                  "stripped_test.jsonl", "split_*.parquet", "data_report.json", "SHA256SUMS", "build_data_error.log",
+                  FSQ_NOTICE_NAME)
 MAX_STRIPPED = 1000
 # The hf:// scan is I/O-bound: DuckDB threads set how many range requests run at once. The research
 # timings (53 s for the 10 smoke files, fsq-data.md) used 8; the connect() default of 4 took ~3x longer.
 EXTRACT_THREADS = 8
+DUCKDB_RAM_FRACTION = 0.5  # FULL extraction: DuckDB gets half the RAM available at start, pandas the rest
+SPILL_SUBDIR = "laya_duckdb_spill"
 
 
 @dataclass(frozen=True)
@@ -68,6 +77,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p.add_argument("--pool", help="use this pool parquet instead of extracting from the FSQ release")
     p.add_argument("--models", nargs="+", default=["laya", "laya_ml"], help="config model keys to budget for")
     p.add_argument("--init-tokenizer", help="checkpoint dir whose tokenizer/ replaces the Hub tokenizers (tests)")
+    p.add_argument("--duckdb-memory", help="FULL extraction: DuckDB memory_limit, e.g. 4GB "
+                                           f"(default: {int(DUCKDB_RAM_FRACTION * 100)}%% of the RAM available now)")
+    p.add_argument("--duckdb-threads", type=int, help="FULL extraction: DuckDB threads (default: max("
+                                                      f"{EXTRACT_THREADS}, CPU count); the hf:// scan is I/O-bound)")
+    p.add_argument("--duckdb-temp", help=f"FULL extraction: spill under <dir>/{SPILL_SUBDIR} (default: <out>), "
+                                         "removed afterwards")
+    p.add_argument("--verify-frozen", action="store_true",
+                   help="FULL: exit 1 unless the JSONL fingerprint matches config data.frozen_manifest")
+    p.add_argument("--write-manifest", help="FULL: write the fingerprint manifest (hashes, counts, versions) here")
     return p.parse_args(argv)
 
 
@@ -88,21 +106,22 @@ def _pool_category_ids(pool: pd.DataFrame) -> set[str]:
     return ids
 
 
-def _extract_pool(cfg: dict, smoke: bool) -> tuple[pd.DataFrame, dict, set[str], set[str]]:
+def _extract_pool(cfg: dict, args: argparse.Namespace, out: Path) -> tuple[pd.DataFrame, dict, set[str], set[str]]:
     token = os.environ.get("HF_TOKEN", "")
     if not token.strip():
         raise ValueError("HF_TOKEN is not set (the FSQ dataset is gated); set it or pass --pool")
-    con = extract.connect(threads=EXTRACT_THREADS)
+    if args.smoke:
+        return extract.extract_release(cfg, smoke=True, token=token, settings={"threads": EXTRACT_THREADS})
+    spill = (_resolve(args.duckdb_temp) if args.duckdb_temp else out) / SPILL_SUBDIR
+    settings = {"threads": args.duckdb_threads or max(EXTRACT_THREADS, os.cpu_count() or 1),
+                "memory_limit": args.duckdb_memory or extract.auto_memory_limit(DUCKDB_RAM_FRACTION) or "4GB",
+                "temp_directory": str(spill)}
     try:
-        extract.create_hf_secret(con, token)
-        cats = extract.load_categories(con, extract.release_paths(cfg)["categories_glob"])
-        extract.verify_level1(set(cats["level1_category_name"]),
-                              labels.expected_level1_names(cfg["data"].get("extra_level1_names", ())))
-        pool, info = extract.extract_pool(con, cfg, smoke=smoke, categories=cats)
+        pool, info, ids, names = extract.extract_release(cfg, smoke=False, token=token, settings=settings)
     finally:
-        con.close()
-    names = set(cats["level1_category_name"]) | set(cats["level2_category_name"].dropna())
-    return pool, info, set(cats["category_id"]), names
+        shutil.rmtree(spill, ignore_errors=True)
+    duck = {k: v for k, v in settings.items() if k != "temp_directory"}
+    return pool, {**info, "duckdb": duck}, ids, names
 
 
 def load_pool(args: argparse.Namespace, cfg: dict, out: Path) -> tuple[pd.DataFrame, dict, set[str], set[str]]:
@@ -115,7 +134,7 @@ def load_pool(args: argparse.Namespace, cfg: dict, out: Path) -> tuple[pd.DataFr
             shutil.copyfile(src, target)
         names = set(labels.expected_level1_names(cfg["data"].get("extra_level1_names", ())))
         return pool, {"source": "file", "path": str(src), "rows": len(pool)}, _pool_category_ids(pool), names
-    pool, info, ids, names = _extract_pool(cfg, args.smoke)
+    pool, info, ids, names = _extract_pool(cfg, args, out)
     pool.to_parquet(target, index=False)
     info = {"source": "extract", "path": str(target), "rows": len(pool), **info}
     return pool, info, ids | _pool_category_ids(pool), names
@@ -248,15 +267,65 @@ def _save_splits(out: Path, splits: dict[str, pd.DataFrame]) -> None:
             splits[name].to_parquet(out / f"split_{name}.parquet", index=False)
 
 
+def write_clean_train(ctx: RowContext, out: Path, train: pd.DataFrame) -> dict[str, Any]:
+    """train.jsonl: the train split serialised like an eval split (alphabetical keys, no augmentation,
+    true labels). The baselines (B1, B3) train on it; the trainer reads train_e{k}.jsonl only."""
+    rows, stats = emit(ctx, out, "train", TRAIN_SPLIT, records_from_split(train, ctx.keep_fields, ctx.scheme))
+    return {"stats": stats, "labels": _label_counts(rows)}
+
+
+class FrozenDataError(RuntimeError):
+    """The JSONL fingerprint differs from config data.frozen_manifest (--verify-frozen)."""
+
+
+def _check_args(cfg: dict, args: argparse.Namespace) -> None:
+    _check_models(cfg, args.models)
+    if args.smoke and (args.verify_frozen or args.write_manifest):
+        raise ValueError("--verify-frozen and --write-manifest apply to FULL builds (drop --smoke)")
+
+
+def _duckdb_warning(cfg: dict, args: argparse.Namespace) -> str | None:
+    """The pin is enforced where DuckDB samples the pool (FULL extraction); elsewhere it only warns."""
+    expected = cfg["data"].get("duckdb_version")
+    return extract.check_duckdb_version(expected, strict=not (args.smoke or args.pool)) if expected else None
+
+
+def _set_aside_traps(cfg: dict, pool: pd.DataFrame, out: Path) -> tuple[pd.DataFrame, dict, pd.DataFrame]:
+    return traps.set_aside_candidates(pool, out, per_pattern=int(cfg["data"]["trap_per_pattern"]),
+                                      seed=int(cfg["data"]["split_seed"]),
+                                      keep_fields=tuple(cfg["serialise"]["keep_fields"]))
+
+
+def _full_fields(cfg: dict, out: Path, results: dict, trap_info: dict, split_info: dict) -> dict[str, Any]:
+    names = [f"{k}.jsonl" for k in results]
+    return {"traps": trap_info, **headline(cfg, split_info),
+            **freeze.full_build_fields(out, names, cfg["data"].get("frozen_manifest"), project_root())}
+
+
+def _finish_full(args: argparse.Namespace, report: dict[str, Any]) -> None:
+    """--verify-frozen first (a mismatching build must not overwrite a manifest), then --write-manifest."""
+    check = report["frozen_check"]
+    if args.verify_frozen and check["status"] not in ("match", "not_frozen"):
+        raise FrozenDataError(freeze.mismatch_message(check))
+    if args.write_manifest:
+        freeze.write_manifest(_resolve(args.write_manifest), report)
+
+
 def build(args: argparse.Namespace) -> dict[str, Any]:
     cfg = load_config(_resolve(args.config))
-    _check_models(cfg, args.models)
+    _check_args(cfg, args)
     out = _resolve(args.out)
     out.mkdir(parents=True, exist_ok=True)
     _clear_stale(out)
+    duck_warning = _duckdb_warning(cfg, args)
     pool, pool_info, cat_ids, cat_names = load_pool(args, cfg, out)
+    full = not args.smoke
+    if full:  # every trap candidate leaves the pool before any split exists (§5.3)
+        pool, trap_info, candidates = _set_aside_traps(cfg, pool, out)
     spec = split_spec(cfg, args.smoke)
-    splits, brands = make_splits(pool, spec)
+    splits, brands, split_info = make_splits_with_info(pool, spec)
+    if full:
+        traps.assert_unseen(splits, candidates)
     _save_splits(out, splits)
     models = load_models(cfg, args.models, _resolve(args.init_tokenizer))
     ctx = make_context(cfg, models, cat_ids, cat_names)
@@ -264,65 +333,20 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
     epochs = int(cfg["smoke"]["epochs"] if args.smoke else cfg["train"]["epochs"])
     results = {**write_eval(ctx, out, splits, seed), **write_train(ctx, out, splits["train"], cfg["augment"],
                                                                      seed, epochs)}
-    warnings = [*spec.warnings, *leakage_warnings(cat_ids),
-                *(smoke_capacity_warnings(cfg, results) if args.smoke else [])]
-    notice = write_notice(out, cfg["data"]["fsq_release"])
-    report = {**_report(cfg, args, pool_info, splits, brands, warnings, models, ctx, results, epochs, out),
-              "notice": notice}
+    if full:
+        results["train"] = write_clean_train(ctx, out, splits["train"])
+    warnings = [*spec.warnings, *leakage_warnings(cat_ids), *([duck_warning] if duck_warning else []),
+                *(trap_info["warnings"] if full else smoke_capacity_warnings(cfg, results))]
+    report = {**data_report(cfg, args.smoke, pool_info, splits, brands, warnings, models, ctx, results, epochs, out),
+              "notice": write_notice(out, cfg["data"]["fsq_release"])}
+    if full:
+        report.update(_full_fields(cfg, out, results, trap_info, split_info))
     (out / "data_report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False, default=str),
                                           encoding="utf-8")
     write_sha256sums(out)
+    if full:
+        _finish_full(args, report)
     return report
-
-
-def _report(cfg: dict, args: argparse.Namespace, pool_info: dict, splits: dict[str, pd.DataFrame],
-            brands: set[str], warnings: list[str], models: list[dict], ctx: RowContext,
-            results: dict[str, dict], epochs: int, out: Path) -> dict[str, Any]:
-    """data_report.json: everything needed to review the build without re-running it."""
-    extraction = {k: v for k, v in pool_info.items() if k not in ("source", "path", "rows")}
-    return {
-        "release": cfg["data"]["fsq_release"], "mode": "smoke" if args.smoke else "full",
-        "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "out": str(out),
-        "pool": {k: pool_info[k] for k in ("source", "path", "rows")},
-        "extraction": extraction if pool_info["source"] == "extract" else None,
-        "split_sizes": {n: len(splits[n]) for n in SPLIT_ORDER},
-        "label_distributions": {n: {str(k): int(v) for k, v in splits[n]["label"].value_counts().sort_index().items()}
-                                for n in SPLIT_ORDER},
-        "row_label_distributions": {k: r["labels"] for k, r in results.items()},
-        "stats": {k: r["stats"] for k, r in results.items()},
-        "warnings": list(warnings), "brands": len(brands), "epochs": epochs,
-        "seed": int(cfg["data"]["split_seed"]), "scheme": ctx.scheme,
-        "models": {m["name"]: {k: m[k] for k in ("max_len", "head_max_len", "budget", "tokenizer")} for m in models},
-        "budgets": {m["name"]: m["budget"] for m in models},
-        "leakage": {"category_ids": len(ctx.category_ids), "category_names": len(ctx.category_names)},
-    }
-
-
-def summary_lines(report: dict[str, Any]) -> list[str]:
-    """At most ~12 lines: Colab / VS Code truncate long cell outputs."""
-    ext = report["extraction"]
-    src = f"extracted in {ext['seconds']}s" if ext else f"from {report['pool']['path']}"
-    lines = [f"build_data: {report['mode']} release={report['release']} pool={report['pool']['rows']} rows ({src})",
-             "splits: " + " ".join(f"{k}={v}" for k, v in report["split_sizes"].items() if v),
-             "budgets (state tokens): " + " ".join(f"{k}={v}" for k, v in report["budgets"].items())]
-    train = {k: v for k, v in report["stats"].items() if k.startswith("train_e")}
-    for name, st in report["stats"].items():
-        if name not in train:
-            lines.append(_stats_line(name, st))
-    lines.append(f"train x{len(train)} epochs: " + "; ".join(
-        f"{st['written']} rows, {st['compressed']} compressed, {st['rejected']} rejected" for st in train.values()))
-    if report["warnings"]:
-        lines.append(f"warnings ({len(report['warnings'])}): {report['warnings'][0]}")
-    lines.append(f"wrote {report['out']} (data_report.json, SHA256SUMS, {FSQ_NOTICE_NAME})")
-    return lines
-
-
-def _stats_line(name: str, st: dict) -> str:
-    base = f"{name}: {st['written']} rows"
-    if "compressed" not in st:
-        return base
-    return (f"{base}, {st['compressed']} compressed, {st['rejected']} rejected, no-evidence {st['no_evidence']}, "
-            f"tokens p50/p95/max {st['tokens_p50']:.0f}/{st['tokens_p95']:.0f}/{st['tokens_max']}")
 
 
 def _redact(text: str) -> str:

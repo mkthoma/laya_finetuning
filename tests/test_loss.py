@@ -142,3 +142,49 @@ def test_gradients_reach_encoder_and_head_and_act_head_gets_zero_grads(tiny_ckpt
     act_grads = [g for n, g in grads.items() if n.startswith("act_head.")]
     assert act_grads and all(torch.count_nonzero(g) == 0 for g in act_grads)
     assert torch.isfinite(parts.total) and parts.rl.item() != 0.0
+
+
+def _val_items(tok, n=23):
+    from laya_poc.items import build_items
+    from synth import rows_from_records, synthetic_records
+    rows = rows_from_records(synthetic_records(n, seed=5), "val")
+    return [it for r in rows for it in build_items(tok, r, 512, 192)]
+
+
+def test_evaluate_items_batches_by_length_and_is_order_and_batch_size_invariant(tiny_ckpt_dir, monkeypatch):
+    import math
+
+    import laya
+
+    from laya_poc import loss as LS
+
+    agent = laya.load(str(tiny_ckpt_dir), device="cpu")
+    model, pad = agent.model, agent.tok.pad_token_id
+    items = _val_items(agent.tok)
+    seen, real = [], LS.collate_items
+
+    def spy(groups, pad_id):
+        seen.append([len(it["ids"]) for it in groups[0]])
+        return real(groups, pad_id)
+
+    monkeypatch.setattr(LS, "collate_items", spy)
+    model.train()
+    ref = LS.evaluate_items(model, items, device="cpu", fp16=False, pad_id=pad, batch_size=5)
+    assert model.training                                          # mode restored
+    assert [len(b) for b in seen] == [5, 5, 5, 5, 3] and len(seen) == math.ceil(len(items) / 5)
+    flat = [n for b in seen for n in b]
+    assert flat == sorted(flat)                                    # length-sorted: little padding per batch
+    for bs, order in ((64, items), (1, items[::-1]), (7, items[3:] + items[:3])):
+        m = LS.evaluate_items(model, order, device="cpu", fp16=False, pad_id=pad, batch_size=bs)
+        assert (m["val_acc"], m["val_macro_f1"], m["n"]) == (ref["val_acc"], ref["val_macro_f1"], ref["n"])
+        assert m["val_ce"] == pytest.approx(ref["val_ce"], rel=1e-5)
+
+
+def test_evaluate_items_rejects_a_bad_batch_size(tiny_ckpt_dir):
+    import laya
+
+    from laya_poc.loss import evaluate_items
+    agent = laya.load(str(tiny_ckpt_dir), device="cpu")
+    with pytest.raises(ValueError, match="batch_size"):
+        evaluate_items(agent.model, _val_items(agent.tok, 2), device="cpu", fp16=False,
+                       pad_id=agent.tok.pad_token_id, batch_size=0)

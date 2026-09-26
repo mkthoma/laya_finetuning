@@ -1,5 +1,5 @@
 """How a training run is laid out: exploration sigma, learning rate, parameter groups, seeds,
-batching, epochs and the exact number of micro/optimiser steps.
+batching, epochs, the items of each epoch file and the exact number of micro/optimiser steps.
 
 Sigma follows upstream exactly (a per-epoch step function, cell08.py:133-134). The learning-rate
 schedule and the no-decay parameter groups are the design doc's deliberate deviations (§5.9):
@@ -7,6 +7,7 @@ linear warm-up then linear decay to 0, and no weight decay on biases, norms and 
 """
 from __future__ import annotations
 
+import argparse
 import json
 import math
 from dataclasses import dataclass
@@ -15,6 +16,7 @@ from typing import Any, Callable, Sequence
 
 from .config import card_from_gpu_name
 from .io_utils import iter_jsonl
+from .items import build_items, count_state_tokens, internal_question, state_room
 
 # micro_seed layout: seed * 10**9 + epoch * 10**6 + micro_idx (collision-free inside these bounds).
 _MAX_EPOCHS = 1000
@@ -152,7 +154,72 @@ def count_items(path: Path) -> int:
     return sum(len(json.loads(row["questions"])) for row in iter_jsonl(path))
 
 
-# ---- resolved run settings (CLI options + config + hardware) ----
+def load_items(path: Path, tok: Any, max_len: int, head_max_len: int, *,
+               labelled_only: bool = False) -> tuple[list[dict], int]:
+    """Training items of one JSONL file, and how many of them had their state truncated."""
+    items, truncated, rooms = [], 0, {}
+    for row in iter_jsonl(path):
+        if labelled_only and row.get("label") is None:
+            continue
+        row_items = build_items(tok, row, max_len, head_max_len)
+        if any(len(it["markers"]) != len(it["target"]) for it in row_items):
+            raise ValueError(f"row {row.get('id')}: marker count differs from the number of options")
+        qkey = row["questions"]
+        if qkey not in rooms:
+            rooms[qkey] = [state_room(tok, internal_question(qid, q), max_len, head_max_len)
+                           for qid, q in json.loads(qkey).items()]
+        n_tokens = count_state_tokens(tok, row["state"])
+        truncated += sum(n_tokens > room for room in rooms[qkey])
+        items.extend(row_items)
+    return items, truncated
+
+
+# ---- train_single's options, resolved into run settings (CLI options + config + hardware) ----
+
+TRAIN_DESCRIPTION = "Single-process port of upstream train_ddp.py (upstream_nb/cell08.py main()), resumable."
+
+
+def _count(value: str) -> int:
+    n = int(value)
+    if n < 0:
+        raise argparse.ArgumentTypeError(f"must be >= 0, got {n}")
+    return n
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """train_single's command line (resolve_settings turns the parsed options into Settings)."""
+    p = argparse.ArgumentParser(prog="python -m laya_poc.train_single", description=TRAIN_DESCRIPTION)
+    p.add_argument("--run-dir", required=True, help="absolute run directory (log.jsonl, ckpt/, final/)")
+    p.add_argument("--data-dir", required=True, help="absolute data directory (train_e{k}.jsonl, val.jsonl)")
+    p.add_argument("--config", default=None, help="config.yaml (default: <project root>/config.yaml)")
+    p.add_argument("--model", choices=("laya", "laya_ml"), default="laya")
+    p.add_argument("--seed", type=_count, default=11)
+    p.add_argument("--init", default="hub", help="'hub' (pinned revision) or an absolute Laya checkpoint dir")
+    p.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
+    p.add_argument("--card", choices=("auto", "T4", "L4", "A10", "CPU"), default="auto")
+    p.add_argument("--grad-ckpt", choices=("auto", "on", "off"), default="auto")
+    for flag in ("--epochs", "--max-micro-steps", "--crash-at-micro-step", "--micro-batch", "--effective-batch",
+                 "--ckpt-every-micro-steps", "--eval-every-opt-steps"):
+        p.add_argument(flag, type=_count, default=None, help="0 disables" if "every" in flag else None)
+    p.add_argument("--keep-last", type=_count, default=None, help="checkpoints kept, >= 1 (default: config)")
+    p.add_argument("--ckpt-every-min", type=float, default=None, help="0 disables (default: config)")
+    p.add_argument("--max-nonfinite", type=_count, default=10)
+    p.add_argument("--print-every", type=_count, default=10)
+    p.add_argument("--initial-eval", action="store_true", help="eval val at opt 0, before training (not on resume)")
+    p.add_argument("--final-eval", action="store_true")
+    p.add_argument("--save-final", action="store_true")
+    p.add_argument("--save-best", action="store_true", help="export the best val macro-F1 weights to <run-dir>/best")
+    p.add_argument("--mirror-dir", default=None, help="absolute directory for a copy of each checkpoint")
+    return p
+
+
+def abs_path(value: str | None, flag: str) -> Path | None:
+    if value is not None and not Path(value).is_absolute():
+        raise ValueError(f"{flag} must be an absolute path, got {value!r}")
+    return None if value is None else Path(value)
+
+
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -172,6 +239,7 @@ class Settings:
     ckpt_every_min: float
     eval_every_opt_steps: int | None
     keep_last: int
+    eval_batch_size: int = 32
 
 
 def _or(value: Any, default: Any) -> Any:
@@ -205,4 +273,4 @@ def resolve_settings(opts: Any, cfg: dict, data_dir: Path) -> Settings:
         ckpt_every_micro_steps=opts.ckpt_every_micro_steps or None,
         ckpt_every_min=float(_or(opts.ckpt_every_min, tc["ckpt_every_min"])),
         eval_every_opt_steps=_or(opts.eval_every_opt_steps, tc["eval_every_opt_steps"]) or None,
-        keep_last=keep_last)
+        keep_last=keep_last, eval_batch_size=int(cfg.get("eval", {}).get("batch_size", 32)))

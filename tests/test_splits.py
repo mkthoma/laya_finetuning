@@ -104,3 +104,19 @@ def test_assert_splits_detects_brand_leak():
     df = S.add_keys(pd.DataFrame([{"name": "Mega Mart", "locality": "B", "country": "GB", "label": "Retail"}]))
     with pytest.raises(AssertionError, match="brand leak"):
         S.assert_splits({"val": df}, {"mega mart"}, _spec())
+
+
+def test_make_splits_with_info_reports_the_id_pool_and_matches_make_splits():
+    pool, spec = _pool(), _spec()
+    splits, brands = S.make_splits(pool, spec)
+    splits2, brands2, info = S.make_splits_with_info(pool, _spec())
+    assert brands2 == brands
+    for name in S.SPLIT_ORDER:
+        pd.testing.assert_frame_equal(splits2[name], splits[name])
+    # ID pool = n_l1 == 1 rows of the ID countries, brands removed, <= 5 per (name, country), deduped on key
+    assert info["id_pool"] == sum(info["id_pool_labels"].values())
+    assert set(info["id_pool_labels"]) == set(LABELS)
+    ids_in_id_splits = sum(len(splits[n]) for n in ("train", "val", "test_id"))
+    assert ids_in_id_splits <= info["id_pool"] <= 3 * 400
+    assert info["brand_pool"] == len(pool[pool["name"].isin(["Mega Mart Ltd", "Quick Cafe"])
+                                          & pool["country"].isin(spec.id_countries)])

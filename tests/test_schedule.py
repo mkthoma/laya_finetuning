@@ -166,6 +166,15 @@ def test_plan_steps_matches_trainer_simulation(n, mb, acc, cap):
     assert S.plan_steps(n, mb, acc, cap) == {"total_micro": micro, "total_opt": opt}
 
 
+def test_e1_plan_matches_the_design_numbers():
+    """E1 (doc §6.2): 25k questions + 7% stripped copies, T4 profile MB 8 x ACC 4, 4 epochs, eval every 250."""
+    n = round(25000 * 1.07)
+    plan = S.plan_steps([n] * 4, micro_batch=8, grad_accum=4, max_micro_steps=None)
+    assert plan == {"total_micro": 4 * 3344, "total_opt": 4 * 836}
+    assert plan["total_opt"] // 250 == 13                     # periodic evals (3.4: 13 evals)
+    assert 2002 < 3344                                        # config e1.crash_at_micro_step falls in epoch 0
+
+
 @pytest.mark.parametrize("kw", [dict(micro_batch=0), dict(grad_accum=0), dict(max_micro_steps=0)])
 def test_plan_steps_validates(kw):
     args = dict(n_items_per_epoch=[10], micro_batch=2, grad_accum=2, max_micro_steps=None) | kw
@@ -214,6 +223,7 @@ def test_resolve_settings_on_cpu_uses_cpu_defaults_and_config(cfg, tmp_path):
     assert (s.max_len, s.head_max_len) == (cfg["model"]["laya"]["max_len"], cfg["model"]["laya"]["head_max_len"])
     assert s.ckpt_every_min == cfg["train"]["ckpt_every_min"] and s.keep_last == cfg["train"]["keep_last"]
     assert s.eval_every_opt_steps == cfg["train"]["eval_every_opt_steps"] and s.ckpt_every_micro_steps is None
+    assert s.eval_batch_size == cfg["eval"]["batch_size"]
     s = S.resolve_settings(_opts(model="laya_ml", card="T4", grad_ckpt="off", eval_every_opt_steps=0,
                                  ckpt_every_min=0, keep_last=1), cfg, data)
     assert (s.card, s.micro_batch, s.grad_accum, s.grad_ckpt) == ("T4", 8, 4, False)
@@ -235,3 +245,17 @@ def test_resolve_settings_rejects_keep_last_below_one(cfg, tmp_path):
     bad_cfg = {**cfg, "train": {**cfg["train"], "keep_last": 0}}
     with pytest.raises(ValueError, match="keep.last"):
         S.resolve_settings(_opts(), bad_cfg, data)
+
+
+def test_load_items_counts_truncated_states(en_tokenizer, tmp_path):
+    from laya_poc.io_utils import write_jsonl
+    from synth import rows_from_records
+    rows = rows_from_records([({"country": "GB", "name": "Rosa Pizza"}, "dining"),
+                              ({"country": "GB", "name": "word " * 600}, "retail"),
+                              ({"country": "GB"}, None)], "val")
+    write_jsonl(tmp_path / "v.jsonl", rows)
+    items, truncated = S.load_items(tmp_path / "v.jsonl", en_tokenizer, 512, 192)
+    assert len(items) == 3 and truncated == 1
+    assert all(len(it["markers"]) == 10 and it["qtype"] == 0 for it in items)
+    labelled, _ = S.load_items(tmp_path / "v.jsonl", en_tokenizer, 512, 192, labelled_only=True)
+    assert len(labelled) == 2

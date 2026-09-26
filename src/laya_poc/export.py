@@ -1,4 +1,5 @@
-"""Write and patch Laya checkpoint directories (upstream save, cell08.py:251-263, plus fixes).
+"""Laya checkpoint directories: load one for training, write and patch them (upstream save,
+cell08.py:251-263, plus fixes).
 
 Layout that `laya.load` accepts: model.safetensors (fp16 state dict of the *unwrapped* model),
 encoder/ (config only), tokenizer/, rl_agent_config.json; plus NOTICE.md, NOTICE_FSQ.txt and Laya's
@@ -15,7 +16,7 @@ import math
 import os
 import shutil
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from . import notice as N
 
@@ -34,6 +35,24 @@ def _check_temperature(t: float) -> float:
 def _temperatures(cfg: dict) -> list[float]:
     """[choice, score, noul], padded with 1.0 (Laya indexes all three; a short list raises there)."""
     return (list(cfg.get("temperature") or DEFAULT_TEMPERATURE) + list(DEFAULT_TEMPERATURE))[:3]
+
+
+def load_for_training(init: str, cfg: dict, s: Any) -> tuple[Any, Any, dict]:
+    """Model, tokenizer and base config through the library load path (critique §A 7.6.3-1), on the
+    training device in train() mode; `s` is schedule.Settings. Refuses non-fp32 weights (GradScaler)."""
+    from . import hub
+
+    source = hub.model_spec(cfg, s.model) if init == "hub" else Path(init)
+    agent = hub.load_agent(source, device="cpu")
+    model, tok, base_cfg = agent.model, agent.tok, copy.deepcopy(agent.cfg)
+    dtypes = sorted({str(p.dtype) for p in model.parameters()})
+    if dtypes != ["torch.float32"]:
+        raise RuntimeError(f"GradScaler training needs fp32 parameters, found {dtypes}")
+    model.to(s.device).train()  # the Agent leaves it in eval()
+    if s.grad_ckpt:
+        model.encoder.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        model.head_checkpointing = True
+    return model, tok, base_cfg
 
 
 def fp16_state_dict(model: Any) -> dict:
@@ -69,6 +88,17 @@ def _write_json_atomic(path: Path, obj: dict) -> None:
     os.replace(tmp, path)
 
 
+_RESERVED = {CONFIG_NAME, "model.safetensors", "LICENSE", N.CHECKPOINT_NOTICE_NAME, N.FSQ_NOTICE_NAME}
+
+
+def _check_extra(extra: Mapping[str, dict]) -> dict[str, dict]:
+    """Sidecar names: plain *.json file names that do not replace a file the loader or licence needs."""
+    bad = [n for n in extra if n in _RESERVED or not n.endswith(".json") or Path(n).name != n or n.startswith(".")]
+    if bad:
+        raise ValueError(f"extra_json names must be plain new *.json file names, got {bad}")
+    return dict(extra)
+
+
 def checkpoint_provenance(init: str, cfg: dict, model: str) -> dict[str, str | None]:
     """save_laya_checkpoint's provenance kwargs: the Hub repo[/subfolder] at the pinned revision
     (init 'hub') or the local --init path (no revision), the pinned Laya commit and the FSQ release."""
@@ -97,15 +127,18 @@ def write_notices(ckpt_dir: Path, *, model_name: str, base_repo: str | None = No
 def save_laya_checkpoint(model: Any, tok: Any, base_cfg: dict, out_dir: str | Path, *, max_len: int,
                          head_max_len: int, model_name: str, temperature_choice: float | None = None,
                          base_repo: str | None = None, base_revision: str | None = None,
-                         laya_commit: str | None = None, fsq_release: str | None = None) -> Path:
+                         laya_commit: str | None = None, fsq_release: str | None = None,
+                         extra_json: Mapping[str, dict] | None = None) -> Path:
     """Write a complete Laya checkpoint directory; replaces `out_dir` only once fully written.
 
     The optional provenance (base checkpoint repo and Hub revision, pinned Laya commit, FSQ release)
     goes into NOTICE.md / NOTICE_FSQ.txt; without it they say "not recorded" (the Laya commit falls
-    back to the installed package's PEP 610 record).
+    back to the installed package's PEP 610 record). `extra_json` ({file name: object}) adds sidecar
+    files that must appear together with the weights (e.g. best/'s train_eval.json marker).
     """
     from safetensors.torch import save_file
 
+    extra = _check_extra(extra_json or {})
     cfg = export_config(base_cfg, max_len=max_len, head_max_len=head_max_len, model_name=model_name,
                         temperature_choice=temperature_choice)
     sd = fp16_state_dict(model)
@@ -119,6 +152,8 @@ def save_laya_checkpoint(model: Any, tok: Any, base_cfg: dict, out_dir: str | Pa
     _write_json_atomic(partial / CONFIG_NAME, cfg)
     write_notices(partial, model_name=model_name, base_repo=base_repo, base_revision=base_revision,
                   laya_commit=laya_commit, fsq_release=fsq_release)
+    for name, obj in extra.items():
+        _write_json_atomic(partial / name, obj)
     if out.exists():
         shutil.rmtree(out)
     os.replace(partial, out)

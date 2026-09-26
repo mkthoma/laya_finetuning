@@ -75,15 +75,28 @@ def _check_size(spec: SplitSpec, name: str, got: int, want: int) -> None:
     spec.warnings.append(msg)
 
 
-def make_splits(pool: pd.DataFrame, spec: SplitSpec) -> tuple[dict[str, pd.DataFrame], set[str]]:
-    """Build every split from the labelled pool. Returns (splits, brand set)."""
-    df = add_keys(pool[pool["n_l1"] == 1])
+def id_pool(df: pd.DataFrame, spec: SplitSpec) -> tuple[pd.DataFrame, pd.DataFrame, set[str]]:
+    """(ID pool that train/val/test_id are drawn from, brand rows, brand set) from keyed n_l1 == 1 rows:
+    ID countries, top brands moved out, <= max_rows_per_name_country per (name, country), unique keys."""
     idp = df[df["country"].isin(spec.id_countries)]
     brands = top_brands(idp, spec.brand_top_n)
     brand_pool = idp[idp["nname"].isin(brands)]
     idp = idp[~idp["nname"].isin(brands)]
     idp = cap_per_name_country(idp, spec.max_rows_per_name_country, spec.seed)
-    idp = idp.drop_duplicates("key")
+    return idp.drop_duplicates("key"), brand_pool, brands
+
+
+def make_splits(pool: pd.DataFrame, spec: SplitSpec) -> tuple[dict[str, pd.DataFrame], set[str]]:
+    """Build every split from the labelled pool. Returns (splits, brand set)."""
+    splits, brands, _ = make_splits_with_info(pool, spec)
+    return splits, brands
+
+
+def make_splits_with_info(pool: pd.DataFrame,
+                          spec: SplitSpec) -> tuple[dict[str, pd.DataFrame], set[str], dict[str, object]]:
+    """make_splits plus the ID-pool composition (the Event headline rule, §5.2, counts the ID pool)."""
+    df = add_keys(pool[pool["n_l1"] == 1])
+    idp, brand_pool, brands = id_pool(df, spec)
 
     test_id = natural_sample(idp, spec.test_size, spec.seed)
     rest = idp.drop(test_id.index)
@@ -107,7 +120,9 @@ def make_splits(pool: pd.DataFrame, spec: SplitSpec) -> tuple[dict[str, pd.DataF
     for name in SPLIT_ORDER:
         _check_size(spec, name, len(splits[name]), wanted[name])
     assert_splits(splits, brands, spec)
-    return splits, brands
+    info = {"id_pool": len(idp), "brand_pool": len(brand_pool),
+            "id_pool_labels": {str(k): int(v) for k, v in idp["label"].value_counts().sort_index().items()}}
+    return splits, brands, info
 
 
 def assert_splits(splits: dict[str, pd.DataFrame], brands: set[str], spec: SplitSpec) -> None:

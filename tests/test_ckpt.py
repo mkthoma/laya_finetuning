@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import sys
@@ -149,3 +150,228 @@ def test_hard_kill_ends_the_process_with_a_nonzero_code():
     env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")}
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, timeout=120)
     assert out.returncode in (-9, 137) and out.stdout.strip() == "before"
+
+
+# ---- loop state ----
+
+def test_initial_state_has_every_key_the_trainer_and_the_gate_read():
+    fp = {"model": "laya", "seed": 11}
+    st = C.initial_state(fp)
+    assert st == {"epoch": 0, "batch_idx": 0, "micro_step": 0, "opt_step": 0, "best": -1.0, "bad": 0,
+                  "nonfinite": 0, "min_scale": None, "skipped": 0, "nonfinite_applied": 0, "evals": 0,
+                  "best_opt_step": None, "best_eval": None, "last_eval": None, "initial_eval": None,
+                  "truncated": {}, "fingerprint": fp}
+    assert C.initial_state(fp)["truncated"] is not st["truncated"]       # no shared mutable default
+
+
+# ---- GradScaler step outcome (gate: skipped fp16 steps are reported, non-finite grads applied must be 0) ----
+
+@pytest.mark.parametrize("enabled,before,after,norm,expected", [
+    (True, 65536.0, 32768.0, float("inf"), (True, False)),    # found inf: step skipped, scale backed off
+    (True, 65536.0, 32768.0, float("nan"), (True, False)),
+    (True, 65536.0, 65536.0, 3.2, (False, False)),            # normal step
+    (True, 65536.0, 131072.0, 3.2, (False, False)),           # growth after growth_interval clean steps
+    (True, 8.0, 8.0, float("inf"), (False, True)),            # finite grads whose norm overflowed: applied
+    (False, 1.0, 1.0, float("nan"), (False, True)),           # no scaler (CPU): nothing is ever skipped
+    (False, 1.0, 1.0, 0.7, (False, False)),
+])
+def test_opt_step_outcome(enabled, before, after, norm, expected):
+    assert C.opt_step_outcome(enabled, before, after, norm) == expected
+
+
+def test_opt_step_outcome_matches_a_real_grad_scaler():
+    """The scale drop is exactly GradScaler's found-inf decision (CPU GradScaler, same update kernel)."""
+    scaler = torch.amp.GradScaler("cpu", init_scale=16.0, growth_interval=2)
+    p = torch.nn.Parameter(torch.ones(3))
+    opt = torch.optim.SGD([p], lr=0.1)
+    seen = []
+    for bad in (False, True, False, False, False, True):
+        before, w = scaler.get_scale(), p.detach().clone()
+        scaler.scale((p * (float("inf") if bad else 1.0)).sum()).backward()
+        scaler.unscale_(opt)
+        norm = float(torch.nn.utils.clip_grad_norm_([p], 1.0))
+        scaler.step(opt)
+        scaler.update()
+        opt.zero_grad(set_to_none=True)
+        skipped, applied = C.opt_step_outcome(True, before, scaler.get_scale(), norm)
+        assert skipped is bad and applied is False
+        assert torch.equal(p.detach(), w) is bad                         # a skipped step leaves the weights
+        seen.append(scaler.get_scale())
+    assert seen == [16.0, 8.0, 8.0, 16.0, 16.0, 8.0]
+
+
+# ---- best/ directory across crashes (save-best) ----
+
+def _best(run_dir, name, opt_step):
+    d = run_dir / name
+    d.mkdir(parents=True)
+    (d / "model.safetensors").write_bytes(f"weights@{opt_step}".encode())
+    (d / C.BEST_INFO).write_text(json.dumps(C.best_marker(opt_step=opt_step, micro_step=4 * opt_step,
+                                                          model="laya", seed=11, eval_result=None)))
+    return d
+
+
+def _weights(d):
+    return (d / "model.safetensors").read_bytes().decode()
+
+
+def test_best_marker_is_readable_by_export_check_as_a_train_summary():
+    ev = {"val_ce": 1.2, "val_acc": 0.5, "val_macro_f1": 0.4, "n": 32, "seconds": 1.0}
+    m = C.best_marker(opt_step=250, micro_step=1000, model="laya", seed=11, eval_result=ev)
+    assert (m["opt_step"], m["micro_step"], m["val_macro_f1"], m["model"], m["seed"]) == (250, 1000, 0.4, "laya", 11)
+    assert m["final_eval"] == ev          # export_check --train-summary <best>/train_eval.json compares with this
+    assert C.best_marker(opt_step=9, micro_step=36, model="laya", seed=11, eval_result=None)["val_macro_f1"] is None
+
+
+def test_best_step_reads_the_marker(tmp_path):
+    assert C.best_step(tmp_path / "best") is None
+    _best(tmp_path, "best", 7)
+    assert C.best_step(tmp_path / "best") == 7
+    (tmp_path / "best" / C.BEST_INFO).write_text("{not json")
+    assert C.best_step(tmp_path / "best") is None
+
+
+def test_stage_best_parks_only_a_committed_best(tmp_path):
+    _best(tmp_path, "best", 3)
+    C.stage_best(tmp_path, committed_opt_step=2)          # best@3 came after the last checkpoint: overwritten
+    assert C.best_step(tmp_path / "best") == 3 and not (tmp_path / C.BEST_PREV).exists()
+    C.stage_best(tmp_path, committed_opt_step=None)       # no checkpoint yet: nothing is committed
+    assert not (tmp_path / C.BEST_PREV).exists()
+    C.stage_best(tmp_path, committed_opt_step=3)          # committed by the checkpoint at opt 3: keep it
+    assert not (tmp_path / "best").exists() and C.best_step(tmp_path / C.BEST_PREV) == 3
+    C.stage_best(tmp_path, committed_opt_step=3)          # nothing to park (best/ is being rewritten)
+    assert C.best_step(tmp_path / C.BEST_PREV) == 3
+
+
+def test_commit_best_drops_the_parked_copy(tmp_path):
+    _best(tmp_path, "best", 5)
+    _best(tmp_path, C.BEST_PREV, 3)
+    C.commit_best(tmp_path)
+    assert C.best_step(tmp_path / "best") == 5 and not (tmp_path / C.BEST_PREV).exists()
+    C.commit_best(tmp_path)                               # idempotent
+
+
+def test_reconcile_restores_the_best_the_checkpoint_knows(tmp_path):
+    # ckpt at opt 4 had best@4; eval at opt 6 exported best@6 (best@4 parked); killed before the next ckpt
+    _best(tmp_path, C.BEST_PREV, 4)
+    _best(tmp_path, "best", 6)
+    (tmp_path / "best.partial").mkdir()
+    assert C.reconcile_best(tmp_path, best_opt_step=4) == "restored"
+    assert C.best_step(tmp_path / "best") == 4 and _weights(tmp_path / "best") == "weights@4"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["best"]
+
+
+def test_reconcile_keeps_a_matching_best_and_drops_a_stale_parked_copy(tmp_path):
+    _best(tmp_path, "best", 4)
+    _best(tmp_path, C.BEST_PREV, 2)
+    assert C.reconcile_best(tmp_path, best_opt_step=4) == "kept"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["best"]
+
+
+def test_reconcile_removes_a_best_the_checkpoint_never_saw(tmp_path):
+    _best(tmp_path, "best", 3)                            # exported before the first checkpoint
+    assert C.reconcile_best(tmp_path, best_opt_step=None) == "removed"
+    assert not (tmp_path / "best").exists()
+
+
+def test_reconcile_restores_after_a_kill_between_park_and_export(tmp_path):
+    _best(tmp_path, C.BEST_PREV, 4)                       # best/ parked, the new export never landed
+    assert C.reconcile_best(tmp_path, best_opt_step=4) == "restored"
+    assert C.best_step(tmp_path / "best") == 4
+
+
+def test_reconcile_reports_a_lost_best_and_leaves_foreign_dirs_alone(tmp_path):
+    assert C.reconcile_best(tmp_path, best_opt_step=None) == "kept"          # fresh run, nothing on disk
+    assert C.reconcile_best(tmp_path, best_opt_step=4) == "missing"          # deleted by hand
+    (tmp_path / "best").mkdir()                                              # no marker: not ours
+    assert C.reconcile_best(tmp_path, best_opt_step=None) == "kept" and (tmp_path / "best").exists()
+
+
+# ---- best/ in the --mirror-dir: a resume from the mirror after the run dir is lost ----
+
+def test_mirror_best_copies_the_named_best_and_skips_an_identical_copy(tmp_path):
+    run, mirror = tmp_path / "run", tmp_path / "drive"
+    _best(run, "best", 4)
+    C.mirror_best(run, mirror, 4)
+    copy = C.mirror_best_dir(mirror, 4)
+    assert copy.name == "best-0000004" and C.best_step(copy) == 4 and _weights(copy) == "weights@4"
+    (copy / "model.safetensors").write_bytes(b"sentinel")          # same export (same marker): not copied again
+    C.mirror_best(run, mirror, 4)
+    assert _weights(copy) == "sentinel"
+    C.mirror_best(run, mirror, None)                               # no best yet: nothing to mirror
+    assert sorted(p.name for p in mirror.iterdir()) == ["best-0000004"]
+
+
+def test_mirror_best_replaces_a_copy_of_another_export_at_the_same_step(tmp_path):
+    """A lost trajectory's orphan copy (mirrored, then killed before its checkpoint) must not stand in for
+    the replay's export at that step: GPU replays are not bit-exact, so the markers (eval) differ."""
+    run, mirror = tmp_path / "run", tmp_path / "drive"
+    orphan = _best(mirror, "best-0000004", 4)
+    (orphan / C.BEST_INFO).write_text(json.dumps(C.best_marker(opt_step=4, micro_step=16, model="laya", seed=11,
+                                                               eval_result={"val_macro_f1": 0.3})))
+    (mirror / "best-0000004.partial").mkdir()                      # a copy killed half-way
+    _best(run, "best", 4)
+    C.mirror_best(run, mirror, 4)
+    assert _weights(C.mirror_best_dir(mirror, 4)) == "weights@4"
+    assert sorted(p.name for p in mirror.iterdir()) == ["best-0000004"]
+
+
+def test_mirror_best_refuses_a_best_dir_that_is_not_the_named_best(tmp_path):
+    run, mirror = tmp_path / "run", tmp_path / "drive"
+    _best(run, "best", 6)
+    with pytest.raises(RuntimeError, match="opt 4"):
+        C.mirror_best(run, mirror, 4)
+    assert not C.mirror_best_dir(mirror, 4).exists()
+
+
+def test_prune_mirror_best_keeps_only_the_copy_the_mirrored_checkpoint_names(tmp_path):
+    mirror = tmp_path / "drive"
+    for step in (2, 6, 9):
+        _best(mirror, f"best-{step:07d}", step)
+    (mirror / "best-0000009.partial").mkdir()
+    (mirror / "step0000008.pt").write_bytes(b"x")
+    (mirror / "best").mkdir()                                      # not a copy of ours: left alone
+    C.prune_mirror_best(mirror, 6)
+    assert sorted(p.name for p in mirror.iterdir()) == ["best", "best-0000006", "step0000008.pt"]
+    C.prune_mirror_best(mirror, None)
+    assert sorted(p.name for p in mirror.iterdir()) == ["best", "step0000008.pt"]
+    C.prune_mirror_best(tmp_path / "absent", 3)                    # no mirror yet: nothing to do
+
+
+def test_mirror_ckpt_copies_atomically_and_prunes(tmp_path):
+    parts, mirror = _setup(), tmp_path / "drive"
+    paths = [_save(tmp_path, parts, step, keep_last=5) for step in (1, 2, 3)]
+    for p in paths:
+        C.mirror_ckpt(p, mirror, keep_last=2)
+    assert sorted(p.name for p in mirror.iterdir()) == ["step0000002.pt", "step0000003.pt"]
+    assert (mirror / "step0000003.pt").read_bytes() == paths[-1].read_bytes()
+
+
+def test_reconcile_restores_the_best_from_the_mirror_when_the_run_dir_lost_it(tmp_path):
+    run, mirror = tmp_path / "run", tmp_path / "drive"
+    run.mkdir()
+    _best(mirror, "best-0000002", 2)
+    _best(mirror, "best-0000006", 6)       # mirrored, then killed before the checkpoint that names it
+    assert C.reconcile_best(run, best_opt_step=2, mirror_dir=mirror) == "from_mirror"
+    assert C.best_step(run / "best") == 2 and _weights(run / "best") == "weights@2"
+    assert sorted(p.name for p in run.iterdir()) == ["best"]
+    assert C.best_step(C.mirror_best_dir(mirror, 2)) == 2          # the mirror keeps its copy
+
+
+def test_reconcile_prefers_the_local_copies_over_the_mirror(tmp_path):
+    run, mirror = tmp_path / "run", tmp_path / "drive"
+    _best(run, C.BEST_PREV, 4)
+    _best(run, "best", 6)
+    m = _best(mirror, "best-0000004", 4)
+    (m / "model.safetensors").write_bytes(b"mirror copy")
+    assert C.reconcile_best(run, best_opt_step=4, mirror_dir=mirror) == "restored"
+    assert _weights(run / "best") == "weights@4"
+
+
+def test_reconcile_reports_missing_when_neither_the_run_dir_nor_the_mirror_has_it(tmp_path):
+    run, mirror = tmp_path / "run", tmp_path / "drive"
+    _best(run, "best", 6)
+    _best(mirror, "best-0000002", 2)
+    assert C.reconcile_best(run, best_opt_step=4, mirror_dir=mirror) == "missing"
+    assert C.reconcile_best(run, best_opt_step=4, mirror_dir=tmp_path / "no-mirror") == "missing"
+    assert C.best_step(run / "best") == 6                          # left for the user to inspect

@@ -95,24 +95,29 @@ def evaluate_items(model: Any, items: list[dict], *, device: str, fp16: bool, pa
                    batch_size: int = 32) -> dict:
     """Soft-target CE, accuracy and macro-F1 (raw-logit argmax vs item["label"]).
 
-    Runs in eval() under no_grad and restores the previous mode: left in eval(), dropout and
-    head checkpointing would silently stay off for the rest of training (common.py:189).
+    Batches of `batch_size` items in length order (the full 3000-row val set pads little that way);
+    each batch's results move to the CPU at once, so the GPU never holds more than one batch. Runs in
+    eval() under no_grad and restores the previous mode: left in eval(), dropout and head
+    checkpointing would silently stay off for the rest of training (common.py:189).
     """
     if not items:
         raise ValueError("no labelled items to evaluate")
+    if batch_size < 1:
+        raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+    order = sorted(range(len(items)), key=lambda i: len(items[i]["ids"]))  # stable: deterministic batches
     was_training, ce, pred = model.training, [], []
     model.eval()
     try:
         with torch.no_grad():
-            for start in range(0, len(items), batch_size):
-                batch = collate_items([items[start:start + batch_size]], pad_id)
+            for start in range(0, len(order), batch_size):
+                batch = collate_items([[items[i] for i in order[start:start + batch_size]]], pad_id)
                 logits, _, t = forward(model, batch, device, fp16)
                 logits = logits.float().masked_fill(~t["marker_mask"], -1e4)
                 ce.append(-(t["target"] * torch.log_softmax(logits, -1)).sum(-1).cpu())
                 pred.append(logits.argmax(-1).cpu())
     finally:
         model.train(was_training)
-    y, yhat = np.array([it["label"] for it in items]), torch.cat(pred).numpy()
+    y, yhat = np.array([items[i]["label"] for i in order]), torch.cat(pred).numpy()
     k = max(len(it["markers"]) for it in items)
     return {"val_ce": float(torch.cat(ce).mean()), "val_acc": float((yhat == y).mean()),
             "val_macro_f1": macro_f1(y, yhat, labels=list(range(k))), "n": len(items)}

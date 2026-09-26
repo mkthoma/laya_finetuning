@@ -139,6 +139,26 @@ def test_overwrites_an_existing_output_directory(source_agent, tmp_path):
     assert not (out / "stale.txt").exists() and (out / "model.safetensors").exists()
 
 
+def test_extra_json_lands_inside_the_checkpoint_and_laya_still_loads_it(source_agent, tmp_path):
+    import laya
+    marker = {"opt_step": 250, "final_eval": {"val_acc": 0.5, "n": 3}, "name": "Café"}
+    out = X.save_laya_checkpoint(source_agent.model, source_agent.tok, source_agent.cfg, tmp_path / "best",
+                                 max_len=512, head_max_len=192, model_name="m",
+                                 extra_json={"train_eval.json": marker})
+    assert json.loads((out / "train_eval.json").read_text(encoding="utf-8")) == marker
+    assert not (tmp_path / "best.partial").exists()
+    agent = laya.load(str(out), device="cpu")
+    assert len(_probs(agent)) == len(STATES)
+
+
+@pytest.mark.parametrize("name", ["model.safetensors", "rl_agent_config.json", "../x.json", "sub/x.json", "x.txt"])
+def test_extra_json_cannot_clobber_checkpoint_files_or_escape(source_agent, tmp_path, name):
+    with pytest.raises(ValueError, match="extra_json"):
+        X.save_laya_checkpoint(source_agent.model, source_agent.tok, source_agent.cfg, tmp_path / "o",
+                               max_len=512, head_max_len=192, model_name="m", extra_json={name: {}})
+    assert not (tmp_path / "o").exists()
+
+
 def test_rejects_wrapped_model_state_dict(source_agent, tmp_path):
     class Wrapper(torch.nn.Module):
         def __init__(self, inner):

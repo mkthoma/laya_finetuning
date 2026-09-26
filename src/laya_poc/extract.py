@@ -8,10 +8,17 @@ Verified facts this module relies on (release 2026-09-15, DuckDB 1.5.5):
   File names change between releases (places_000089, places-00000.zstd, Spark part-*-c000.zstd),
   so a best-file entry is either a number (this release's places_NNNNNN.parquet) or a file name.
 - `unresolved_flags` is NULL (not []) when a place has no flags.
+- FULL mode scans every places file (~58M rows pass the filters): pass 1 reads only the narrow filter/label
+  columns and keeps the cap smallest hash values per (country, label) as a top-N aggregate (8 bytes per kept
+  place and thread instead of a 58M-row window), pass 2 reads the wide columns of the places with those
+  hashes and applies the same capped ranking. `hash()` is DuckDB-version specific, so the version is
+  pinned (`data.duckdb_version`, `check_duckdb_version`).
 The HF token only ever goes into `create_hf_secret`, whose SQL is never logged or echoed.
 """
 from __future__ import annotations
 
+import os
+import sys
 import time
 from pathlib import PurePosixPath
 from typing import Any, Iterable
@@ -24,6 +31,10 @@ FALLBACK_COUNTRY = "KR"  # OOD-script fallback (design §5.3), always extracted 
 _CAP_COLUMNS = frozenset({"country", "label"})
 _TEXT_COLUMNS = ("fsq_place_id", "name", "address", "locality", "region", "postcode", "admin_region",
                  "post_town", "po_box", "country", "tel", "website", "email")
+_WIDE_COLUMNS = (", ".join(_TEXT_COLUMNS) + ", CAST(facebook_id AS VARCHAR) AS facebook_id, instagram, twitter, "
+                 "fsq_category_ids")
+_NARROW_COLUMNS = "fsq_place_id, country"
+_SELECTED = "_laya_selected_ids"
 
 
 def _lit(value: Any) -> str:
@@ -35,8 +46,10 @@ def _list_lit(values: Iterable[Any]) -> str:
     return "[" + ", ".join(_lit(v) for v in values) + "]"
 
 
-def connect(threads: int = 4, memory_limit: str = "8GB", *, httpfs: bool = True) -> Any:
-    """In-memory DuckDB connection configured for the pool scan (httpfs for hf:// paths)."""
+def connect(threads: int = 4, memory_limit: str = "8GB", *, httpfs: bool = True,
+            temp_directory: str | None = None) -> Any:
+    """In-memory DuckDB connection configured for the pool scan (httpfs for hf:// paths). A
+    temp_directory lets operators spill to disk instead of failing at memory_limit."""
     import duckdb
 
     con = duckdb.connect()
@@ -44,6 +57,8 @@ def connect(threads: int = 4, memory_limit: str = "8GB", *, httpfs: bool = True)
         con.execute("INSTALL httpfs; LOAD httpfs;")
     con.execute(f"SET threads={int(threads)}")
     con.execute(f"SET memory_limit={_lit(memory_limit)}")
+    if temp_directory:
+        con.execute(f"SET temp_directory={_lit(temp_directory)}")
     con.execute("SET preserve_insertion_order=false")
     con.execute("SET enable_progress_bar=false")  # keep notebook logs sparse
     check_sql_features(con)
@@ -128,39 +143,102 @@ def _cap_partition(cap_col: str) -> str:
     return ", ".join(parts)
 
 
-def pool_sql(files: list[str], countries: list[str], exclude_flags: list[str], cap_col: str, cap: int,
-             seed: int) -> str:
-    """Labelled, filtered, capped pool query. Needs `register_category_map` on the connection first."""
+def _check_query_args(files: list[str], countries: list[str], cap: int | None = None) -> None:
     if not files:
         raise ValueError("pool_sql needs at least one parquet file (files is empty)")
     if not countries:
         raise ValueError("pool_sql needs at least one country")
-    if int(cap) < 1:
+    if cap is not None and int(cap) < 1:
         raise ValueError(f"cap must be >= 1, got {cap}")
-    partition = _cap_partition(cap_col)
+
+
+def _labelled_sql(files: list[str], countries: list[str], exclude_flags: list[str], columns: str,
+                  extra_where: str = "") -> str:
+    """CTEs ending in `labelled`: the filtered places with l1s (sorted distinct level-1 names), label
+    (= l1s[1]), n_l1 and first_l1 (level-1 of the first listed known category: the multi-category trap
+    gold, §5.3). Shared by the one-query form and both FULL-mode passes so they cannot drift apart."""
     flags = f"AND NOT list_has_any(coalesce(unresolved_flags, []), {_list_lit(exclude_flags)})" if exclude_flags else ""
     return f"""
 WITH p AS (
-  SELECT {", ".join(_TEXT_COLUMNS)}, CAST(facebook_id AS VARCHAR) AS facebook_id, instagram, twitter,
-         fsq_category_ids,
-         list_sort(list_distinct(list_filter(
-           list_transform(fsq_category_ids, x -> getvariable('cmap')[x]), y -> y IS NOT NULL))) AS l1s
+  SELECT {columns},
+         list_filter(list_transform(fsq_category_ids, x -> getvariable('cmap')[x]), y -> y IS NOT NULL) AS l1_listed
   FROM read_parquet({_list_lit(files)}, hive_partitioning=false)
   WHERE country IN ({", ".join(_lit(c) for c in countries)})
     AND date_closed IS NULL
     {flags}
     AND len(coalesce(fsq_category_ids, [])) > 0
     AND name IS NOT NULL
+    {extra_where}
+), q AS (
+  SELECT * EXCLUDE (l1_listed), list_sort(list_distinct(l1_listed)) AS l1s, l1_listed[1] AS first_l1 FROM p
 ), labelled AS (
-  SELECT *, l1s[1] AS label, len(l1s) AS n_l1 FROM p
+  SELECT * EXCLUDE (first_l1), l1s[1] AS label, len(l1s) AS n_l1, first_l1 FROM q
   WHERE len(l1s) >= 1
     AND len(list_filter(l1s, y -> NOT list_contains({_list_lit(sorted(labels.L1_TO_KEY))}, y))) = 0
-)
+)"""
+
+
+def _hash_key(seed: int) -> str:
+    return f"hash(fsq_place_id || {_lit(int(seed))})"
+
+
+def _capped_sql(files: list[str], countries: list[str], exclude_flags: list[str], partition: str, cap: int,
+                seed: int, extra_where: str = "") -> str:
+    return _labelled_sql(files, countries, exclude_flags, _WIDE_COLUMNS, extra_where) + f"""
 SELECT * FROM labelled
 QUALIFY row_number() OVER (PARTITION BY {partition}
-                           ORDER BY hash(fsq_place_id || {_lit(int(seed))}), fsq_place_id) <= {int(cap)}
+                           ORDER BY {_hash_key(seed)}, fsq_place_id) <= {int(cap)}
 ORDER BY fsq_place_id
 """
+
+
+def pool_sql(files: list[str], countries: list[str], exclude_flags: list[str], cap_col: str, cap: int,
+             seed: int) -> str:
+    """Labelled, filtered, capped pool query. Needs `register_category_map` on the connection first.
+    The per-(country, label) cap (design §7.4.3) makes the pool, and so val/test_id, close to class-balanced
+    rather than natural prevalence (§5.3 wording); changing that means a deliberate re-freeze."""
+    _check_query_args(files, countries, cap)
+    return _capped_sql(files, countries, exclude_flags, _cap_partition(cap_col), cap, seed)
+
+
+def select_sql(files: list[str], countries: list[str], exclude_flags: list[str], cap: int, seed: int) -> str:
+    """FULL pass 1, narrow columns only: per (country, label) the `cap` smallest hash VALUES (min(h, cap)
+    keeps an 8-byte heap entry per place; min_by over the id strings needed > 2 GB with 8 threads)."""
+    _check_query_args(files, countries, cap)
+    return _labelled_sql(files, countries, exclude_flags, _NARROW_COLUMNS + ", fsq_category_ids") + f"""
+SELECT unnest(min({_hash_key(seed)}, {int(cap)})) AS h FROM labelled GROUP BY country, label
+"""
+
+
+def selected_pool_sql(files: list[str], countries: list[str], exclude_flags: list[str], table: str, cap: int,
+                      seed: int) -> str:
+    """FULL pass 2: wide columns of the places whose hash is in `table` (semi-join), capped exactly like
+    `pool_sql`. Exact: every place of a group with hash <= its cap-th smallest hash is in the semi-join
+    (ties included), so ranking that superset by (hash, id) keeps the same rows as ranking the group."""
+    _check_query_args(files, countries, cap)
+    return _capped_sql(files, countries, exclude_flags, "country, label", cap, seed,
+                       f"AND {_hash_key(seed)} IN (SELECT h FROM {table})")
+
+
+def two_pass_pool(con: Any, files: list[str], countries: list[str], exclude_flags: list[str], cap: int,
+                  seed: int) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Exactly `pool_sql(files, countries, exclude_flags, "country, label", cap, seed)`, in bounded memory."""
+    t0 = time.time()
+    con.execute(f"CREATE OR REPLACE TEMP TABLE {_SELECTED} AS {select_sql(files, countries, exclude_flags, cap, seed)}")
+    selected = int(con.execute(f"SELECT count(*) FROM {_SELECTED}").fetchone()[0])
+    t1 = time.time()
+    try:
+        sql = selected_pool_sql(files, countries, exclude_flags, _SELECTED, cap, seed)
+        pool = con.execute(sql).df().reset_index(drop=True)
+    finally:
+        con.execute(f"DROP TABLE IF EXISTS {_SELECTED}")
+    dup = pool["fsq_place_id"][pool["fsq_place_id"].duplicated()]
+    if len(dup) or len(pool) != selected:
+        raise RuntimeError(f"duplicate fsq_place_id in the release (e.g. {sorted(set(dup))[:3]}; pass 1 kept "
+                           f"{selected} ids, pass 2 returned {len(pool)} rows): the split and trap bookkeeping "
+                           "assume unique place ids")
+    return pool, {"passes": 2, "selected": selected, "pass1_seconds": round(t1 - t0, 1),
+                  "pass2_seconds": round(time.time() - t1, 1)}
 
 
 def full_countries(data_cfg: dict[str, Any]) -> list[str]:
@@ -203,9 +281,12 @@ def extract_pool(con: Any, cfg: dict[str, Any], *, smoke: bool,
     cats = categories if categories is not None else load_categories(con, release_paths(cfg)["categories_glob"])
     register_category_map(con, cats)
     t0 = time.time()
-    sql = pool_sql(plan["files"], plan["countries"], list(d["exclude_flags"]), plan["cap_col"], plan["cap"],
-                   int(d["split_seed"]))
-    pool = con.execute(sql).df().reset_index(drop=True)
+    args = (plan["files"], plan["countries"], list(d["exclude_flags"]))
+    if smoke:
+        pool, passes = con.execute(pool_sql(*args, plan["cap_col"], plan["cap"], int(d["split_seed"]))).df(), {}
+        pool = pool.reset_index(drop=True)
+    else:
+        pool, passes = two_pass_pool(con, *args, plan["cap"], int(d["split_seed"]))
     seconds = round(time.time() - t0, 1)
     counts = pool["country"].value_counts()
     rows_by_country = {c: int(counts.get(c, 0)) for c in plan["countries"]}
@@ -218,8 +299,73 @@ def extract_pool(con: Any, cfg: dict[str, Any], *, smoke: bool,
     info = {"mode": "smoke" if smoke else "full", "seconds": seconds, "files": plan["files"],
             "countries": plan["countries"], "cap_col": plan["cap_col"], "cap": plan["cap"], "rows": len(pool),
             "rows_by_country": rows_by_country,
-            "n_l1_hist": {int(k): int(hist[k]) for k in sorted(hist.index)}}
+            "n_l1_hist": {int(k): int(hist[k]) for k in sorted(hist.index)}, **passes}
     return pool, info
+
+
+def extract_release(cfg: dict[str, Any], *, smoke: bool, token: str,
+                    settings: dict[str, Any]) -> tuple[pd.DataFrame, dict[str, Any], set[str], set[str]]:
+    """connect(**settings) -> HF secret -> categories + level-1 check -> pool.
+    Returns (pool, info, category ids, level-1 and level-2 category names) for the leakage checks."""
+    con = connect(**settings)
+    try:
+        create_hf_secret(con, token)
+        cats = load_categories(con, release_paths(cfg)["categories_glob"])
+        verify_level1(set(cats["level1_category_name"]),
+                      labels.expected_level1_names(cfg["data"].get("extra_level1_names", ())))
+        pool, info = extract_pool(con, cfg, smoke=smoke, categories=cats)
+    finally:
+        con.close()
+    names = set(cats["level1_category_name"]) | set(cats["level2_category_name"].dropna())
+    return pool, info, set(cats["category_id"]), names
+
+
+def check_duckdb_version(expected: str, *, strict: bool = True) -> str | None:
+    """hash()-ordered sampling is only reproducible on one DuckDB version: raise (strict, FULL
+    extraction) or return a warning (smoke / --pool builds) when the installed one differs."""
+    try:
+        import duckdb
+        found = duckdb.__version__
+    except ImportError:
+        found = "not installed"
+    if found == str(expected):
+        return None
+    msg = (f"duckdb {found} is installed but data.duckdb_version is {expected}: the hash()-based pool "
+           f"sample would differ from the frozen build; pip install duckdb=={expected}")
+    if strict:
+        raise RuntimeError(msg)
+    return msg
+
+
+def available_ram_bytes() -> int | None:
+    """Physical memory available to a new process (Windows, /proc/meminfo, sysconf); None if unknown."""
+    if sys.platform == "win32":
+        import ctypes
+
+        class _MemoryStatus(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong)] + [
+                (name, ctypes.c_ulonglong) for name in ("total_phys", "avail_phys", "total_page", "avail_page",
+                                                        "total_virtual", "avail_virtual", "avail_ext_virtual")]
+
+        status = _MemoryStatus(dwLength=ctypes.sizeof(_MemoryStatus))
+        return int(status.avail_phys) if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)) else None
+    try:
+        with open("/proc/meminfo", encoding="ascii") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        return int(os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"))
+    except (AttributeError, ValueError, OSError):
+        return None
+
+
+def auto_memory_limit(fraction: float = 0.5) -> str | None:
+    """DuckDB memory_limit as a fraction of the RAM available now (the rest holds the pandas pool)."""
+    ram = available_ram_bytes()
+    return None if ram is None else f"{max(256, int(ram * fraction / 1e6))}MB"
 
 
 def _file_name(path: str) -> str:

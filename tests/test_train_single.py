@@ -57,9 +57,12 @@ def _same(a, b, where="ckpt"):
 
 
 def _assert_same_checkpoint(path_a, path_b):
+    """Everything a resume restores. `state.initial_eval` is left out: it records the opt-0 eval of a run with
+    --initial-eval (the control), which does not change training."""
     a, b = (torch.load(str(p), map_location="cpu", weights_only=False) for p in (path_a, path_b))
-    for key in ("model", "optimizer", "scheduler", "scaler", "state"):
+    for key in ("model", "optimizer", "scheduler", "scaler"):
         _same(a[key], b[key], key)
+    _same(*({k: v for k, v in ck["state"].items() if k != "initial_eval"} for ck in (a, b)), "state")
 
 
 @pytest.fixture(scope="module")
@@ -154,7 +157,11 @@ def test_final_checkpoint_notice_records_its_provenance(control, tiny_ckpt_dir):
 
 def test_resume_after_hard_kill_replays_the_control_run(control, tiny_ckpt_dir, data_dir, tmp_path, capsys):
     run_dir = tmp_path / "resumed"
-    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(ROOT / "src"), os.environ.get("PYTHONPATH", "")])}
+    # Bit-equality needs the same CPU reduction order: the crash subprocess must use this process's torch
+    # thread count (an earlier in-process test may have changed it with torch.set_num_threads).
+    threads = str(torch.get_num_threads())
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(ROOT / "src"), os.environ.get("PYTHONPATH", "")]),
+           "OMP_NUM_THREADS": threads, "MKL_NUM_THREADS": threads}
     crash = subprocess.run([sys.executable, "-m", "laya_poc.train_single",
                             *_args(run_dir, data_dir, tiny_ckpt_dir, "--crash-at-micro-step", "6")],
                            env=env, cwd=str(ROOT), capture_output=True, text=True, timeout=600)
@@ -218,8 +225,8 @@ def test_resume_refuses_a_checkpoint_from_different_settings(control, tiny_ckpt_
     args = _args(run_dir, data_dir, tiny_ckpt_dir)
     args[args.index("--max-micro-steps") + 1] = "10"
     assert T.main(args) == 1
-    err = capsys.readouterr().err.strip()
-    assert len(err.splitlines()) == 1 and "different settings" in err
+    ours = [x for x in capsys.readouterr().err.splitlines() if x.startswith("train_single:")]  # not laya warnings
+    assert len(ours) == 1 and "different settings" in ours[0]
     assert (run_dir / "error.log").exists()
 
 
@@ -285,17 +292,3 @@ def test_vram_is_reported_in_decimal_gigabytes(monkeypatch):
     monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda *a, **k: 14_500_000_000)
     assert T.vram_gb("cuda") == {"vram_alloc_gb": 7.25, "vram_reserved_gb": 14.5}
     assert T.vram_gb("cpu") == {"vram_alloc_gb": None, "vram_reserved_gb": None}
-
-
-def test_load_items_counts_truncated_states(en_tokenizer, tmp_path):
-    from laya_poc.io_utils import write_jsonl
-    from synth import rows_from_records
-    rows = rows_from_records([({"country": "GB", "name": "Rosa Pizza"}, "dining"),
-                              ({"country": "GB", "name": "word " * 600}, "retail"),
-                              ({"country": "GB"}, None)], "val")
-    write_jsonl(tmp_path / "v.jsonl", rows)
-    items, truncated = T.load_items(tmp_path / "v.jsonl", en_tokenizer, 512, 192)
-    assert len(items) == 3 and truncated == 1
-    assert all(len(it["markers"]) == 10 and it["qtype"] == 0 for it in items)
-    labelled, _ = T.load_items(tmp_path / "v.jsonl", en_tokenizer, 512, 192, labelled_only=True)
-    assert len(labelled) == 2
