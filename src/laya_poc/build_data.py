@@ -1,0 +1,355 @@
+"""Build the data directory: pool -> splits -> eval and per-epoch train JSONL (spec §1.2, §2).
+
+    python -m laya_poc.build_data --out <data_dir> [--smoke] [--config <yaml>] [--pool <pool.parquet>]
+                                  [--models laya laya_ml] [--init-tokenizer <abs ckpt dir>]
+
+Without --pool the labelled pool is extracted from the gated FSQ release with DuckDB, using the
+token in $HF_TOKEN (never printed or written). Every state must fit EVERY listed model's exact
+state budget, so one data directory serves both checkpoints. Prints a short summary; full detail
+goes to <data_dir>/data_report.json.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import random
+import shutil
+import sys
+import time
+import traceback
+from collections import Counter
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Sequence
+
+import pandas as pd
+
+from . import extract, labels
+from .augment import augment_epoch
+from .config import load_config, project_root, split_spec
+from .io_utils import sha256_file, write_jsonl, write_sha256sums
+from .notice import FSQ_NOTICE_NAME, fsq_notice
+from .rows import assert_no_leakage, check_reject_rate, make_rows, records_from_split, stripped_rows
+from .serialise import fits_from_counters, state_budget, token_counter
+from .splits import SPLIT_ORDER, make_splits
+
+EVAL_SPLITS = ("val", "test_id")
+OOD_SPLITS = ("ood_country", "ood_script", "ood_brand")
+STALE_PATTERNS = ("train_e*.jsonl", "ood_*.jsonl", "val.jsonl", "test_id.jsonl", "stripped_test.jsonl",
+                  "split_*.parquet", "data_report.json", "SHA256SUMS", "build_data_error.log", FSQ_NOTICE_NAME)
+MAX_STRIPPED = 1000
+# The hf:// scan is I/O-bound: DuckDB threads set how many range requests run at once. The research
+# timings (53 s for the 10 smoke files, fsq-data.md) used 8; the connect() default of 4 took ~3x longer.
+EXTRACT_THREADS = 8
+
+
+@dataclass(frozen=True)
+class RowContext:
+    """Everything make_rows and the leakage/reject checks need, fixed for one build."""
+    scheme: str
+    smoothing: float
+    fits: Callable[[str], bool]
+    count_tokens: Callable[[str], int]
+    keep_fields: tuple[str, ...]
+    evidence_fields: tuple[str, ...]
+    compress_order: tuple[str, ...]
+    address_max_chars: int
+    max_reject_rate: float
+    category_ids: frozenset[str]
+    category_names: frozenset[str]
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(prog="python -m laya_poc.build_data", description=__doc__.split("\n\n")[0])
+    p.add_argument("--out", required=True, help="data directory (relative paths resolve under the project root)")
+    p.add_argument("--smoke", action="store_true", help="smoke-test sizes (config section `smoke`)")
+    p.add_argument("--config", help="config.yaml (default: <project root>/config.yaml)")
+    p.add_argument("--pool", help="use this pool parquet instead of extracting from the FSQ release")
+    p.add_argument("--models", nargs="+", default=["laya", "laya_ml"], help="config model keys to budget for")
+    p.add_argument("--init-tokenizer", help="checkpoint dir whose tokenizer/ replaces the Hub tokenizers (tests)")
+    return p.parse_args(argv)
+
+
+def _resolve(path: str | None) -> Path | None:
+    if path is None:
+        return None
+    p = Path(path).expanduser()
+    return p if p.is_absolute() else project_root() / p
+
+
+def _pool_category_ids(pool: pd.DataFrame) -> set[str]:
+    if "fsq_category_ids" not in pool.columns:
+        return set()
+    ids: set[str] = set()
+    for value in pool["fsq_category_ids"]:
+        if pd.api.types.is_list_like(value):
+            ids.update(str(v) for v in value)
+    return ids
+
+
+def _extract_pool(cfg: dict, smoke: bool) -> tuple[pd.DataFrame, dict, set[str], set[str]]:
+    token = os.environ.get("HF_TOKEN", "")
+    if not token.strip():
+        raise ValueError("HF_TOKEN is not set (the FSQ dataset is gated); set it or pass --pool")
+    con = extract.connect(threads=EXTRACT_THREADS)
+    try:
+        extract.create_hf_secret(con, token)
+        cats = extract.load_categories(con, extract.release_paths(cfg)["categories_glob"])
+        extract.verify_level1(set(cats["level1_category_name"]),
+                              labels.expected_level1_names(cfg["data"].get("extra_level1_names", ())))
+        pool, info = extract.extract_pool(con, cfg, smoke=smoke, categories=cats)
+    finally:
+        con.close()
+    names = set(cats["level1_category_name"]) | set(cats["level2_category_name"].dropna())
+    return pool, info, set(cats["category_id"]), names
+
+
+def load_pool(args: argparse.Namespace, cfg: dict, out: Path) -> tuple[pd.DataFrame, dict, set[str], set[str]]:
+    """(pool, pool report, category ids, category names) and a copy of the pool at out/pool.parquet."""
+    target = out / "pool.parquet"
+    if args.pool:
+        src = _resolve(args.pool)
+        pool = pd.read_parquet(src)
+        if src.resolve() != target.resolve():
+            shutil.copyfile(src, target)
+        names = set(labels.expected_level1_names(cfg["data"].get("extra_level1_names", ())))
+        return pool, {"source": "file", "path": str(src), "rows": len(pool)}, _pool_category_ids(pool), names
+    pool, info, ids, names = _extract_pool(cfg, args.smoke)
+    pool.to_parquet(target, index=False)
+    info = {"source": "extract", "path": str(target), "rows": len(pool), **info}
+    return pool, info, ids | _pool_category_ids(pool), names
+
+
+def _check_models(cfg: dict, names: Sequence[str]) -> None:
+    unknown = [m for m in names if m not in cfg["model"]]
+    if unknown:
+        raise ValueError(f"unknown model(s) {unknown}; expected keys of config `model`: {sorted(cfg['model'])}")
+
+
+def load_models(cfg: dict, names: Sequence[str], init_tokenizer: Path | None) -> list[dict]:
+    """Tokenizer, exact state budget and a cached token counter per model."""
+    from . import hub
+    from .items import assert_options_untrimmed, internal_question
+
+    scheme, margin = cfg["labels"]["scheme"], int(cfg["serialise"]["token_margin"])
+    q = internal_question(labels.QUESTION_NAME, labels.question(scheme)[labels.QUESTION_NAME])
+    models = []
+    for name in names:
+        spec = hub.model_spec(cfg, name)
+        tok = hub.load_tokenizer_dir(init_tokenizer) if init_tokenizer else hub.load_tokenizer(spec)
+        assert_options_untrimmed(tok, q, spec.head_max_len)
+        source = str(init_tokenizer) if init_tokenizer else f"{spec.repo_id}/{spec.subfolder or ''}@{spec.revision}"
+        models.append({"name": name, "count": token_counter(tok), "max_len": spec.max_len,
+                       "head_max_len": spec.head_max_len, "tokenizer": source,
+                       "budget": state_budget(tok, scheme, spec.max_len, spec.head_max_len, margin)})
+    return models
+
+
+def make_context(cfg: dict, models: list[dict], category_ids: set[str], category_names: set[str]) -> RowContext:
+    s = cfg["serialise"]
+    counters = [m["count"] for m in models]
+    return RowContext(
+        scheme=cfg["labels"]["scheme"], smoothing=float(cfg["labels"]["smoothing"]),
+        fits=fits_from_counters([(m["count"], m["budget"]) for m in models]),
+        count_tokens=lambda state: max(c(state) for c in counters),
+        keep_fields=tuple(s["keep_fields"]), evidence_fields=tuple(s["evidence_fields"]),
+        compress_order=tuple(s["compress_order"]), address_max_chars=int(s["address_max_chars"]),
+        max_reject_rate=float(s["max_reject_rate"]),
+        category_ids=frozenset(category_ids), category_names=frozenset(category_names))
+
+
+def emit(ctx: RowContext, out: Path, stem: str, split: str, records: list, **kw: Any) -> tuple[list[dict], dict]:
+    """make_rows -> leakage and reject-rate checks -> <out>/<stem>.jsonl (written only if both pass)."""
+    rows, stats = make_rows(split, records, scheme=ctx.scheme, smoothing=ctx.smoothing, fits=ctx.fits,
+                            compress_order=ctx.compress_order, address_max_chars=ctx.address_max_chars,
+                            evidence_fields=ctx.evidence_fields, count_tokens=ctx.count_tokens, **kw)
+    assert_no_leakage(rows, ctx.keep_fields, ctx.category_ids, ctx.category_names)
+    check_reject_rate(stats, ctx.max_reject_rate)
+    write_jsonl(out / f"{stem}.jsonl", rows)
+    return rows, stats
+
+
+def _label_counts(rows: list[dict]) -> dict[str, int]:
+    counts = Counter(r["label"] if r["label"] is not None else "null" for r in rows)
+    return dict(sorted(counts.items()))
+
+
+def write_eval(ctx: RowContext, out: Path, splits: dict[str, pd.DataFrame], seed: int) -> dict[str, dict]:
+    """val / test_id / non-empty ood_* with alphabetical keys, plus stripped_test from test_id."""
+    results = {}
+    for name in (*EVAL_SPLITS, *(n for n in OOD_SPLITS if len(splits[n]))):
+        recs = records_from_split(splits[name], ctx.keep_fields, ctx.scheme)
+        rows, stats = emit(ctx, out, name, name, recs)
+        results[name] = {"stats": stats, "labels": _label_counts(rows), "rows": rows}
+    test_rows = results["test_id"]["rows"]
+    stripped = stripped_rows(test_rows, min(MAX_STRIPPED, len(test_rows)), seed)
+    assert_no_leakage(stripped, ctx.keep_fields, ctx.category_ids, ctx.category_names)
+    write_jsonl(out / "stripped_test.jsonl", stripped)
+    results["stripped_test"] = {"stats": {"split": "stripped_test", "written": len(stripped), "rejected": 0},
+                                "labels": _label_counts(stripped), "rows": stripped}
+    return results
+
+
+def write_train(ctx: RowContext, out: Path, train: pd.DataFrame, aug_cfg: dict, seed: int,
+                epochs: int) -> dict[str, dict]:
+    """train_e{e}.jsonl: augmentation and field order regenerated from seed*1000+e each epoch."""
+    recs = records_from_split(train, ctx.keep_fields, ctx.scheme)
+    results = {}
+    for epoch in range(epochs):
+        augmented = augment_epoch(recs, aug_cfg, ctx.evidence_fields, seed, epoch)
+        rng = random.Random(seed * 1000 + epoch)
+        rows, stats = emit(ctx, out, f"train_e{epoch}", "train", [(r, lab) for r, lab, _ in augmented],
+                           rng=rng, shuffle=True, aug_tags=[tag for _, _, tag in augmented])
+        results[f"train_e{epoch}"] = {"stats": stats, "labels": _label_counts(rows)}
+    return results
+
+
+def _clear_stale(out: Path) -> None:
+    """Outputs of an earlier build (e.g. more epochs) would otherwise be picked up and checksummed.
+    pool.parquet is kept: it may be the --pool input."""
+    for pattern in STALE_PATTERNS:
+        for path in out.glob(pattern):
+            path.unlink()
+
+
+def leakage_warnings(category_ids: set[str]) -> list[str]:
+    """An empty id set makes the category-id substring check pass vacuously: say so in the report."""
+    if category_ids:
+        return []
+    return ["category-id leakage check had no category ids (the --pool parquet has no fsq_category_ids "
+            "column): states were NOT checked for category-id substrings"]
+
+
+def smoke_capacity_warnings(cfg: dict, results: dict[str, dict], card: str = "T4") -> list[str]:
+    """The smoke run wants smoke.micro_steps micro-batches from train_e0 alone (smoke.epochs = 1)."""
+    mb = cfg["train"]["micro_batch"].get(card)
+    first = results.get("train_e0")
+    if not mb or first is None:
+        return []
+    needed = int(cfg["smoke"]["micro_steps"]) * int(mb)
+    written = first["stats"]["written"]
+    if written >= needed:
+        return []
+    return [f"train_e0 has {written} rows < smoke.micro_steps x {card} micro_batch = {needed}: "
+            "the smoke run would need more than one epoch"]
+
+
+def write_notice(out: Path, release: str) -> dict[str, str]:
+    """<out>/NOTICE_FSQ.txt: the FSQ NOTICE verbatim plus the 'modified' statement (design doc Appendix D)."""
+    path = out / FSQ_NOTICE_NAME
+    path.write_bytes(fsq_notice(release).encode("utf-8"))  # bytes: no newline translation on Windows
+    return {"file": FSQ_NOTICE_NAME, "sha256": sha256_file(path)}
+
+
+def _save_splits(out: Path, splits: dict[str, pd.DataFrame]) -> None:
+    for name in SPLIT_ORDER:
+        if name in ("train", *EVAL_SPLITS) or len(splits[name]):
+            splits[name].to_parquet(out / f"split_{name}.parquet", index=False)
+
+
+def build(args: argparse.Namespace) -> dict[str, Any]:
+    cfg = load_config(_resolve(args.config))
+    _check_models(cfg, args.models)
+    out = _resolve(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    _clear_stale(out)
+    pool, pool_info, cat_ids, cat_names = load_pool(args, cfg, out)
+    spec = split_spec(cfg, args.smoke)
+    splits, brands = make_splits(pool, spec)
+    _save_splits(out, splits)
+    models = load_models(cfg, args.models, _resolve(args.init_tokenizer))
+    ctx = make_context(cfg, models, cat_ids, cat_names)
+    seed = int(cfg["data"]["split_seed"])
+    epochs = int(cfg["smoke"]["epochs"] if args.smoke else cfg["train"]["epochs"])
+    results = {**write_eval(ctx, out, splits, seed), **write_train(ctx, out, splits["train"], cfg["augment"],
+                                                                     seed, epochs)}
+    warnings = [*spec.warnings, *leakage_warnings(cat_ids),
+                *(smoke_capacity_warnings(cfg, results) if args.smoke else [])]
+    notice = write_notice(out, cfg["data"]["fsq_release"])
+    report = {**_report(cfg, args, pool_info, splits, brands, warnings, models, ctx, results, epochs, out),
+              "notice": notice}
+    (out / "data_report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False, default=str),
+                                          encoding="utf-8")
+    write_sha256sums(out)
+    return report
+
+
+def _report(cfg: dict, args: argparse.Namespace, pool_info: dict, splits: dict[str, pd.DataFrame],
+            brands: set[str], warnings: list[str], models: list[dict], ctx: RowContext,
+            results: dict[str, dict], epochs: int, out: Path) -> dict[str, Any]:
+    """data_report.json: everything needed to review the build without re-running it."""
+    extraction = {k: v for k, v in pool_info.items() if k not in ("source", "path", "rows")}
+    return {
+        "release": cfg["data"]["fsq_release"], "mode": "smoke" if args.smoke else "full",
+        "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "out": str(out),
+        "pool": {k: pool_info[k] for k in ("source", "path", "rows")},
+        "extraction": extraction if pool_info["source"] == "extract" else None,
+        "split_sizes": {n: len(splits[n]) for n in SPLIT_ORDER},
+        "label_distributions": {n: {str(k): int(v) for k, v in splits[n]["label"].value_counts().sort_index().items()}
+                                for n in SPLIT_ORDER},
+        "row_label_distributions": {k: r["labels"] for k, r in results.items()},
+        "stats": {k: r["stats"] for k, r in results.items()},
+        "warnings": list(warnings), "brands": len(brands), "epochs": epochs,
+        "seed": int(cfg["data"]["split_seed"]), "scheme": ctx.scheme,
+        "models": {m["name"]: {k: m[k] for k in ("max_len", "head_max_len", "budget", "tokenizer")} for m in models},
+        "budgets": {m["name"]: m["budget"] for m in models},
+        "leakage": {"category_ids": len(ctx.category_ids), "category_names": len(ctx.category_names)},
+    }
+
+
+def summary_lines(report: dict[str, Any]) -> list[str]:
+    """At most ~12 lines: Colab / VS Code truncate long cell outputs."""
+    ext = report["extraction"]
+    src = f"extracted in {ext['seconds']}s" if ext else f"from {report['pool']['path']}"
+    lines = [f"build_data: {report['mode']} release={report['release']} pool={report['pool']['rows']} rows ({src})",
+             "splits: " + " ".join(f"{k}={v}" for k, v in report["split_sizes"].items() if v),
+             "budgets (state tokens): " + " ".join(f"{k}={v}" for k, v in report["budgets"].items())]
+    train = {k: v for k, v in report["stats"].items() if k.startswith("train_e")}
+    for name, st in report["stats"].items():
+        if name not in train:
+            lines.append(_stats_line(name, st))
+    lines.append(f"train x{len(train)} epochs: " + "; ".join(
+        f"{st['written']} rows, {st['compressed']} compressed, {st['rejected']} rejected" for st in train.values()))
+    if report["warnings"]:
+        lines.append(f"warnings ({len(report['warnings'])}): {report['warnings'][0]}")
+    lines.append(f"wrote {report['out']} (data_report.json, SHA256SUMS, {FSQ_NOTICE_NAME})")
+    return lines
+
+
+def _stats_line(name: str, st: dict) -> str:
+    base = f"{name}: {st['written']} rows"
+    if "compressed" not in st:
+        return base
+    return (f"{base}, {st['compressed']} compressed, {st['rejected']} rejected, no-evidence {st['no_evidence']}, "
+            f"tokens p50/p95/max {st['tokens_p50']:.0f}/{st['tokens_p95']:.0f}/{st['tokens_max']}")
+
+
+def _redact(text: str) -> str:
+    token = os.environ.get("HF_TOKEN", "").strip()
+    return text.replace(token, "<redacted>") if token else text
+
+
+def _write_error_log(out: Path | None, exc: BaseException) -> None:
+    if out is None or not out.is_dir():
+        return
+    detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    (out / "build_data_error.log").write_text(_redact(detail), encoding="utf-8")
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        report = build(args)
+    except Exception as exc:  # one-line error for the notebook; the traceback goes to a file
+        message = " ".join(f"build_data: error: {type(exc).__name__}: {exc}".split())
+        print(_redact(message), file=sys.stderr, flush=True)
+        _write_error_log(_resolve(args.out), exc)
+        return 1
+    for line in summary_lines(report):
+        print(line, flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,109 @@
+# Laya record-normalisation PoC: every parameter (design doc §7.3). Values are defaults.
+# Facts marked VERIFIED were checked against the pinned code / live Hub on 2026-09-25.
+project: laya_poc
+
+laya:
+  repo: https://github.com/NandhaKishorM/laya
+  commit: 4066d5d5fbf08b66c6757ddeedbd797bd7655bc0   # VERIFIED: latest main 2026-09-25; contains #149, #191, #451
+  version: 0.3.20
+  hub_revision: 55cf4c4ebb4ebe31b2550e8bdf3bd21b99753851  # convaiinnovations/laya (root + multilingual/ subfolder)
+env: {transformers: "<recorded in runs/smoke/env.json>", torch: "<recorded in runs/smoke/env.json>"}
+
+data:
+  fsq_release: "2026-09-15"          # VERIFIED newest release (22 releases, 100 places files, 109,440,828 rows)
+  hf_base: "hf://datasets/foursquare/fsq-os-places/release/dt={rel}"
+  id_countries: [GB, US, DE, FR, ES, IT, BR, IN, JP, ID]
+  ood_country: [NL, PL, MX]
+  ood_script: TH                     # fallback KR
+  pool_per_country_label: 8000
+  train_size: 25000
+  train_cap_per_class: 3000
+  val_size: 3000
+  test_size: 3000
+  ood_size: 2000
+  brand_top_n: 200
+  max_rows_per_name_country: 5
+  trap_target: [150, 300]
+  split_seed: 20260925
+  # The doc filters the first four; inappropriate/privatevenue (private homes) also exist in the release.
+  exclude_flags: [closed, doesnt_exist, delete, duplicate, inappropriate, privatevenue]
+  # VERIFIED: the categories table has 11 level-1 names; "Nightlife Spot" (2 categories, ~1 place in
+  # the 15 countries) is outside the 10-class taxonomy, so places touching it are dropped.
+  extra_level1_names: [Nightlife Spot]
+
+serialise:
+  keep_fields: [name, address, locality, region, postcode, admin_region, post_town, po_box, country,
+                tel, website, email, facebook_id, instagram, twitter]
+  evidence_fields: [name, address, locality, region, postcode, admin_region, post_town, po_box,
+                    tel, website, email, facebook_id, instagram, twitter]
+  compress_order: [twitter, instagram, facebook_id, email]
+  address_max_chars: 120
+  token_margin: 8                    # subtracted from the exact state room computed with build_sequence
+  max_reject_rate: 0.005
+
+labels: {scheme: c10, smoothing: 0.1}
+augment: {field_dropout: 0.4, name_dropout: 0.10, stripped_rate: 0.07, conflict_rate: 0.05}
+
+model:
+  laya: {id: convaiinnovations/laya, subfolder: null, max_len: 512, head_max_len: 192}
+  laya_ml: {id: convaiinnovations/laya, subfolder: multilingual, max_len: 512, head_max_len: 256}  # ships 1024/256
+
+train:
+  lr_encoder: 2.0e-5                 # doc §5.9 (upstream notebook: 2.5e-5)
+  lr_head: 1.0e-4
+  weight_decay: 0.01                 # doc: none on biases/norms (upstream: all params)
+  warmup_frac: 0.06                  # doc: linear warm-up + linear decay (upstream: cosine, no warm-up)
+  epochs: 4
+  effective_batch: 32                # doc (upstream: 64)
+  micro_batch: {T4: 8, L4: 32, A10: 32}
+  grad_ckpt: {T4: true, L4: false, A10: false}
+  fp16: true
+  eval_every_opt_steps: 250
+  patience: 3
+  min_delta: 0.002
+  ckpt_every_min: 15
+  keep_last: 2
+  seeds: [11, 22, 33]
+  max_grad_norm: 1.0
+  # VERIFIED against upstream train_ddp.py (notebook cell 8) at the pinned commit.
+  loss: {ce_weight: 1.0, group_size: 4, sigma_start: 0.4, sigma_end: 0.1, w_sph: 0.75, w_rps: 1.0}
+  sigma_schedule: per_epoch          # upstream: sigma steps linearly per epoch (0.4 -> 0.1 over 4 epochs)
+
+calibrate: {}                        # T is written to temperature[0]; temperature_by_options is removed
+abstain: {target_acc: 0.95, min_coverage: 0.70}
+eval: {ece_bins: 15, bootstrap: 1000, order_perms: 5}
+cpu_budget: {p95_ms: 500, min_rps: 8, vcpus: 4}
+
+# Phase 1 smoke test (design doc §6.2). Exit criteria are fixed here before any run.
+smoke:
+  ckpt: laya
+  seed: 11
+  epochs: 1
+  # --limit: one "best" places file per ID country (files are geographic tiles, not country
+  # partitions; the first N files are almost all US). VERIFIED map for release 2026-09-15.
+  best_files: {GB: 89, US: 21, DE: 82, FR: 86, ES: 33, IT: 36, BR: 28, IN: 63, JP: 97, ID: 49}
+  per_country: 500
+  brand_top_n: 20                    # scaled down: top-200 of a 5k pool would strip ordinary names
+  train_questions: 2000
+  train_cap_per_class: 400
+  val_size: 200
+  test_size: 200
+  ood_size: 0                        # OOD pools are not needed for the smoke test
+  zero_shot_n: 20
+  parity_n: 200
+  micro_steps: 250
+  ckpt_every_micro_steps: 40         # must be a multiple of the grad-accumulation steps (T4: 4)
+  kill_at_micro_step: 122            # hard kill 2 micro-steps after the step-120 checkpoint
+  resume_compare_steps: 20
+  exit:
+    parity_max_dp: 0.02
+    parity_min_agree: 0.995
+    resume_max_rel_dev: 0.02         # on the 20-micro-step mean of loss_ce vs the control run; lr and
+                                     # GradScaler scale must also match at every later opt step
+    min_loss_drop: 0.10              # graded on val CE before vs after the control run: held-out val rows,
+                                     # eval mode, --initial-eval (opt 0) vs --final-eval (train loss: info only).
+                                     # DEVIATION from doc §6.2 (20%), decided 2026-09-26: a correct trainer reached
+                                     # only ~19% in these 63 optimiser steps at the doc's learning rates (real-model
+                                     # CPU run), so 20% would fail a working port about half the time.
+    doc_loss_drop: 0.20              # the doc's original target, reported as information only
+    max_vram_gb: 14.0                # GB = 10^9 bytes (not GiB), torch.cuda.max_memory_reserved

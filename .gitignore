@@ -1,0 +1,29 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Data, runs and checkpoints never go into git (FSQ rows may not be redistributed; Appendix D)
+data/
+runs/
+preds/
+ckpt_local/
+*.duckdb
+*.parquet
+*.pt
+*.safetensors
+
+# Secrets
+.env
+.env.*
+*.token
+.hf_token
+# build_notebook.py --with-token embeds the HF token in this variant
+notebooks/*.local.ipynb
+
+# Build outputs
+build/
