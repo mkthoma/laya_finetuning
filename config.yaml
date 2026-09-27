@@ -66,8 +66,8 @@ train:
   warmup_frac: 0.06                  # doc: linear warm-up + linear decay (upstream: cosine, no warm-up)
   epochs: 4
   effective_batch: 32                # doc (upstream: 64)
-  micro_batch: {T4: 8, L4: 32, A10: 32}
-  grad_ckpt: {T4: true, L4: false, A10: false}
+  micro_batch: {T4: 8, L4: 32, A10: 32, G4: 32}   # G4 = Colab RTX PRO 6000 Blackwell (95 GB): the doc's L4/A10 recipe
+  grad_ckpt: {T4: true, L4: false, A10: false, G4: false}
   fp16: true
   eval_every_opt_steps: 250
   patience: 3
@@ -81,7 +81,7 @@ train:
   sigma_schedule: per_epoch          # upstream: sigma steps linearly per epoch (0.4 -> 0.1 over 4 epochs)
 
 calibrate: {}                        # T is written to temperature[0]; temperature_by_options is removed
-abstain: {target_acc: 0.95, min_coverage: 0.70}
+abstain: {target_acc: 0.95, min_coverage: 0.70, fallback_coverage: 0.80}   # §5.8.2: tau for 95% answered acc; if coverage < 70%, the 80%-coverage tau
 eval: {ece_bins: 15, bootstrap: 1000, order_perms: 5, batch_size: 64}
 cpu_budget: {p95_ms: 500, min_rps: 8, vcpus: 4}
 
@@ -103,6 +103,28 @@ e1:
   # 15-min timer, so the forced resume below always has a checkpoint to resume from.
   ckpt_every_micro_steps: 2000
   crash_at_micro_step: 2002          # gate "at least one real resume observed or forced": forced, resumes from 2000
+# Phase 3 (design §6.2, matrix §5.14): the seed matrix, run on a Colab G4 in one unattended session.
+# Every trained arm is temperature-fitted on val and evaluated IN-SESSION on every eval split (predictions saved,
+# small), so the Phase 5 metrics need no persisted checkpoints; the 700 trap candidates are scored too, and trap
+# accuracy is computed offline once annotation lands. best/ can optionally be copied to Drive.
+phase3:
+  card: G4
+  # E1's weights were not persisted, so seed 11 is re-run with 22 and 33 under one card profile.
+  arms:
+    - {id: E2, model: laya, scheme: c10, seeds: [11, 22, 33]}
+    - {id: E3, model: laya_ml, scheme: c10, seeds: [11, 22, 33]}
+    - {id: E4, model: laya, scheme: c10, seeds: [11], freeze_encoder: true}      # head-only lower bound
+    - {id: E5, model: laya, scheme: c7, seeds: [11]}
+    - {id: E5, model: laya_ml, scheme: c7, seeds: [11]}
+    # Learning curve: the train split is 25k (doc: 30k is not reachable at a 3000/class cap with Event small),
+    # so 25k is the E2 seed-11 run and 1k/3k/10k are stratified subsets of the same split.
+    - {id: E6, model: laya, scheme: c10, seeds: [11], train_subset: [1000, 3000, 10000]}
+  zero_shot: [laya, laya_ml]         # B2 (Phase 4) is evaluation only, so it runs in the same session
+  eval_splits: [val, test_id, ood_country, ood_script, ood_brand, stripped_test, trap_candidates]
+  order_invariance: {split: test_id, n: 1000, perms: 5, seed: 20260925}
+  evals_per_run: 12                  # small train subsets: eval every max(10, total_opt // 12) opt steps (cap 250)
+  keep_after_run: [best]             # ckpt/ (~5 GB per resumable checkpoint) and final/ are deleted after each arm
+
 gate:                                # design §6.2 gate table; points are macro-F1 x 100
   min_over_zero_shot: 0.10
   min_over_majority: 0.20

@@ -1,5 +1,6 @@
 """How a training run is laid out: exploration sigma, learning rate, parameter groups, seeds,
-batching, epochs, the items of each epoch file and the exact number of micro/optimiser steps.
+batching, epochs, the items of each epoch file and the exact number of micro/optimiser steps;
+train_single's options resolved into Settings, and the fingerprint a resumed run must share.
 
 Sigma follows upstream exactly (a per-epoch step function, cell08.py:133-134). The learning-rate
 schedule and the no-decay parameter groups are the design doc's deliberate deviations (§5.9):
@@ -196,7 +197,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=_count, default=11)
     p.add_argument("--init", default="hub", help="'hub' (pinned revision) or an absolute Laya checkpoint dir")
     p.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
-    p.add_argument("--card", choices=("auto", "T4", "L4", "A10", "CPU"), default="auto")
+    p.add_argument("--card", choices=("auto", "T4", "L4", "A10", "G4", "CPU"), default="auto")
     p.add_argument("--grad-ckpt", choices=("auto", "on", "off"), default="auto")
     for flag in ("--epochs", "--max-micro-steps", "--crash-at-micro-step", "--micro-batch", "--effective-batch",
                  "--ckpt-every-micro-steps", "--eval-every-opt-steps"):
@@ -210,6 +211,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--save-final", action="store_true")
     p.add_argument("--save-best", action="store_true", help="export the best val macro-F1 weights to <run-dir>/best")
     p.add_argument("--mirror-dir", default=None, help="absolute directory for a copy of each checkpoint")
+    p.add_argument("--freeze-encoder", action="store_true",
+                   help="head-only (E4, design §7.10 Option B): freeze the encoder, train the decision head alone")
     return p
 
 
@@ -217,8 +220,6 @@ def abs_path(value: str | None, flag: str) -> Path | None:
     if value is not None and not Path(value).is_absolute():
         raise ValueError(f"{flag} must be an absolute path, got {value!r}")
     return None if value is None else Path(value)
-
-
 
 
 @dataclass(frozen=True)
@@ -240,6 +241,7 @@ class Settings:
     eval_every_opt_steps: int | None
     keep_last: int
     eval_batch_size: int = 32
+    head_only: bool = False  # --freeze-encoder: the encoder is frozen, the optimiser holds the head alone
 
 
 def _or(value: Any, default: Any) -> Any:
@@ -273,4 +275,71 @@ def resolve_settings(opts: Any, cfg: dict, data_dir: Path) -> Settings:
         ckpt_every_micro_steps=opts.ckpt_every_micro_steps or None,
         ckpt_every_min=float(_or(opts.ckpt_every_min, tc["ckpt_every_min"])),
         eval_every_opt_steps=_or(opts.eval_every_opt_steps, tc["eval_every_opt_steps"]) or None,
-        keep_last=keep_last, eval_batch_size=int(cfg.get("eval", {}).get("batch_size", 32)))
+        keep_last=keep_last, eval_batch_size=int(cfg.get("eval", {}).get("batch_size", 32)),
+        head_only=bool(opts.freeze_encoder))
+
+
+# ---- resume identity: the settings a checkpoint must have been written with ----
+
+def run_fingerprint(s: Settings, n_items_per_epoch: Sequence[int]) -> dict:
+    """What a resumed run must share with its checkpoint: the batches, the step plan (and so the LR schedule)
+    and the optimiser's parameter groups (head_only). Hardware and checkpoint/eval cadence may change."""
+    return {"model": s.model, "seed": s.seed, "micro_batch": s.micro_batch, "grad_accum": s.grad_accum,
+            "epochs": s.epochs, "max_micro_steps": s.max_micro_steps, "n_items_per_epoch": list(n_items_per_epoch),
+            "head_only": s.head_only}
+
+
+def _as_current(saved: Any) -> dict | None:
+    """A fingerprint in today's form: one written before --freeze-encoder existed was full fine-tuning."""
+    return {"head_only": False, **saved} if isinstance(saved, dict) else None
+
+
+def same_run(saved: Any, current: dict) -> bool:
+    """True when a checkpoint's fingerprint (`saved`, possibly None or older) is this run's."""
+    return _as_current(saved) == current
+
+
+def check_same_run(path: Path, saved: Any, current: dict) -> None:
+    """Refuse to resume from a checkpoint written with other settings, naming the ones that differ."""
+    old = _as_current(saved)
+    if old == current:
+        return
+    if old is None:
+        diff = "the checkpoint has no settings fingerprint"
+    else:
+        keys = [k for k in current if old.get(k) != current[k]] + [k for k in old if k not in current]
+        diff = ", ".join(f"{k}: {old.get(k)!r} in the checkpoint, {current.get(k)!r} now" for k in keys)
+    raise ValueError(f"{path} was written with different settings ({diff}); rerun with the checkpoint's "
+                     "settings or use a new --run-dir")
+
+
+def saved_fingerprint(path: Path) -> dict | None:
+    """The fingerprint inside a training checkpoint, or None when it cannot be read. Reads the whole file with
+    weights-only unpickling (the loop state holds plain Python values; a type outside torch's allow-list gives
+    None): used only to explain a restore that failed, whose own error is then re-raised."""
+    import torch
+
+    try:
+        fingerprint = torch.load(str(path), map_location="cpu", weights_only=True)["state"]["fingerprint"]
+    except Exception:  # unreadable or not a checkpoint: the caller re-raises the restore's own error
+        return None
+    return fingerprint if isinstance(fingerprint, dict) else None
+
+
+def load_same_run(path: Path, current: dict, **objs: Any) -> dict:
+    """ckpt.load_train_ckpt (model, optimizer, scheduler, scaler restored in place) for a checkpoint of THIS run.
+
+    Another run's checkpoint may fail to load before its fingerprint can be compared (a head-only optimiser has
+    other parameter groups than a full one): the settings that differ are then named instead of torch's error.
+    """
+    from . import ckpt
+
+    try:
+        saved = ckpt.load_train_ckpt(path, **objs)
+    except (ValueError, RuntimeError, KeyError):
+        fingerprint = saved_fingerprint(path)
+        if fingerprint is not None:
+            check_same_run(path, fingerprint, current)
+        raise
+    check_same_run(path, saved.get("fingerprint"), current)
+    return saved

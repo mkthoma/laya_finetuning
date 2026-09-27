@@ -46,6 +46,9 @@ def _list_lit(values: Iterable[Any]) -> str:
     return "[" + ", ".join(_lit(v) for v in values) + "]"
 
 
+HTTP_RETRIES, HTTP_RETRY_WAIT_MS, HTTP_RETRY_BACKOFF = 8, 2000, 2
+
+
 def connect(threads: int = 4, memory_limit: str = "8GB", *, httpfs: bool = True,
             temp_directory: str | None = None) -> Any:
     """In-memory DuckDB connection configured for the pool scan (httpfs for hf:// paths). A
@@ -55,6 +58,10 @@ def connect(threads: int = 4, memory_limit: str = "8GB", *, httpfs: bool = True,
     con = duckdb.connect()
     if httpfs:
         con.execute("INSTALL httpfs; LOAD httpfs;")
+        # Hugging Face answers bursts of range requests with HTTP 429 (seen on a 48-core Colab host):
+        # back off and retry instead of failing the whole scan.
+        con.execute(f"SET http_retries={HTTP_RETRIES}; SET http_retry_wait_ms={HTTP_RETRY_WAIT_MS}; "
+                    f"SET http_retry_backoff={HTTP_RETRY_BACKOFF}")
     con.execute(f"SET threads={int(threads)}")
     con.execute(f"SET memory_limit={_lit(memory_limit)}")
     if temp_directory:

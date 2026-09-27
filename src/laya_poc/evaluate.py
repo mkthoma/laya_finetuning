@@ -12,12 +12,15 @@ NLL comes from the raw choice logits captured inside Laya's decode, as -log_soft
 which; "probs" only for an agent without `_decode_answers`). `n_p_true_zero` still counts rows whose true
 class rounded to 0. macro_f1 averages over every option (labels=range(K)); macro_f1_9 excludes `event`
 (§5.2 headline rule).
-OOD gaps, traps, stripped-test abstention, order invariance and bootstrap CIs (steps 5-7) are Phase 5:
-they reuse `evaluate_rows` / `split_report` on the other splits.
+Multi-split mode (--splits, Phase 3; evaluate_splits.py) runs every split on ONE loaded agent and adds the
+val-chosen abstention threshold, the stripped-test no-evidence metrics and field-order invariance
+(robustness.py, steps 5-6); OOD gaps, seed statistics and bootstrap CIs are computed from its JSON and preds.
 
-    python -m laya_poc.evaluate --ckpt hub|<abs Laya dir> [--model laya|laya_ml]
+    python -m laya_poc.evaluate --ckpt hub|<abs Laya dir> [--model laya|laya_ml] [--scheme c10|c7]
                                 (--rows <split.jsonl> | --split <name> [--data-dir <dir>]) --out <json>
                                 [--preds <jsonl>] [--device cuda|cpu] [--batch-size N] [--n N] [--config yaml]
+    python -m laya_poc.evaluate --ckpt ... --splits <split> ... --data-dir <dir> --out-dir <dir> --preds-dir <dir>
+                                [--extra name=<abs jsonl> ...] [--optional <split> ...] [--order-invariance-out ...]
 """
 from __future__ import annotations
 
@@ -36,6 +39,7 @@ from .config import load_config, project_root
 from .env_check import run_cli, write_json
 from .fallback_guard import FallbackGuard
 from .io_utils import iter_jsonl, write_jsonl
+from .labels import SCHEMES
 from .metrics import macro_f1, report
 from .serialise import has_evidence
 
@@ -66,7 +70,7 @@ def check_question(rows: Sequence[dict], question: dict) -> None:
         got = json.loads(text)
         if got != question or [list(q["criteria"]) for q in got.values()] != order:
             raise ValueError(f"row {row_id} carries a different question (options or their order) than "
-                             f"labels.question(scheme); rebuild the data or fix --config")
+                             f"labels.question(scheme); pass the rows' --scheme, rebuild the data or fix --config")
 
 
 def evidence_mask(rows: Sequence[dict], evidence_fields: Sequence[str]) -> np.ndarray:
@@ -279,9 +283,21 @@ def load_checked(source: Any, device: str) -> Any:
     return agent
 
 
+def eval_settings(cfg: dict, args: argparse.Namespace) -> dict[str, Any]:
+    """Question, option keys, evidence fields and batching, shared by both CLI modes."""
+    from .labels import question as make_question
+
+    scheme = args.scheme or cfg["labels"]["scheme"]
+    question = make_question(scheme)
+    mc = cfg["model"][args.model]
+    return {"scheme": scheme, "question": question, "keys": list(question[next(iter(question))]["criteria"]),
+            "evidence_fields": cfg["serialise"]["evidence_fields"],
+            "batch_size": args.batch_size or int(cfg.get("eval", {}).get("batch_size", DEFAULT_BATCH)),
+            "max_len": int(mc["max_len"]), "head_max_len": int(mc["head_max_len"])}
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     import torch
-    from .labels import question as make_question
     from .parity import free_memory, resolve_source
 
     cfg = load_config(args.config)
@@ -290,26 +306,22 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     source = resolve_source(cfg, args.model, args.ckpt)  # validates the path before any load
     path, split = rows_and_split(args)
     rows = load_rows(path, args.n)
-    scheme = cfg["labels"]["scheme"]
-    question = make_question(scheme)
-    check_question(rows, question)
-    mc = cfg["model"][args.model]
-    batch_size = args.batch_size or int(cfg.get("eval", {}).get("batch_size", DEFAULT_BATCH))
+    s = eval_settings(cfg, args)
+    check_question(rows, s["question"])
+    budget = {k: s[k] for k in ("batch_size", "max_len", "head_max_len")}
     t0, guard = time.perf_counter(), FallbackGuard()
     print(f"evaluate {args.model} ({args.ckpt}) on {split}: {len(rows)} rows, {args.device}", flush=True)
     agent = load_checked(source, args.device)
     device = agent.device.type
-    res, preds = evaluate_rows(agent, rows, question, evidence_fields=cfg["serialise"]["evidence_fields"],
-                               batch_size=batch_size, max_len=int(mc["max_len"]),
-                               head_max_len=int(mc["head_max_len"]), guard=guard, label=f"evaluate {split}")
+    res, preds = evaluate_rows(agent, rows, s["question"], evidence_fields=s["evidence_fields"], guard=guard,
+                               label=f"evaluate {split}", **budget)
     del agent
     free_memory()
     if args.preds:
         write_jsonl(args.preds, preds)
-    return {"model": args.model, "ckpt": args.ckpt, "split": split, "rows": str(path), "scheme": scheme,
-            "labels": list(question[next(iter(question))]["criteria"]), **res, "cpu_fallback": guard.cpu_fallback,
-            "device": device, "batch_size": batch_size, "max_len": int(mc["max_len"]),
-            "head_max_len": int(mc["head_max_len"]), "preds": args.preds, "seconds": round(time.perf_counter() - t0, 2)}
+    return {"model": args.model, "ckpt": args.ckpt, "split": split, "rows": str(path), "scheme": s["scheme"],
+            "labels": s["keys"], **res, "cpu_fallback": guard.cpu_fallback, "device": device, **budget,
+            "preds": args.preds, "seconds": round(time.perf_counter() - t0, 2)}
 
 
 def _line(res: dict[str, Any]) -> str:
@@ -324,27 +336,34 @@ def _line(res: dict[str, Any]) -> str:
 
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
+    from .evaluate_splits import add_multi_args, check_mode
+
     p = argparse.ArgumentParser(prog="laya_poc.evaluate", description=__doc__.splitlines()[0])
     p.add_argument("--ckpt", required=True, help="'hub' (pinned revision) or an absolute Laya checkpoint dir")
     p.add_argument("--model", choices=("laya", "laya_ml"), default="laya",
                    help="config.model entry: max_len/head_max_len (and the Hub checkpoint for --ckpt hub)")
+    p.add_argument("--scheme", choices=sorted(SCHEMES), default=None,
+                   help="label scheme of the rows' question (default: config labels.scheme)")
     p.add_argument("--rows", default=None, help="split JSONL (e.g. <data>/val.jsonl)")
     p.add_argument("--split", default=None, help="split name: reads <data-dir>/<split>.jsonl when --rows is absent")
-    p.add_argument("--data-dir", default=None, help="data dir for --split (default: <project root>/data)")
-    p.add_argument("--out", required=True)
+    p.add_argument("--data-dir", default=None, help="data dir for --split / --splits (default: <project root>/data)")
+    p.add_argument("--out", default=None, help="report JSON (single-split mode, required there)")
     p.add_argument("--preds", default=None, help="per-row predictions JSONL (post-T)")
     p.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
     p.add_argument("--batch-size", type=int, default=None, help="default: config eval.batch_size")
     p.add_argument("--n", type=int, default=None, help="evaluate the first N rows only (default: all)")
     p.add_argument("--config", default=None)
+    add_multi_args(p)
     args = p.parse_args(argv)
-    if not args.rows and not args.split:
-        p.error("one of --rows or --split is required")
+    check_mode(p, args)
     return args
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.splits is not None:
+        from .evaluate_splits import main_multi
+        return main_multi(args)
 
     def body() -> int:
         res = run(args)

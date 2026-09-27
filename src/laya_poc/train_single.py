@@ -9,48 +9,36 @@ are written only at optimiser boundaries and every micro-step reseeds the global
 Phase 2 (E1): --save-best keeps the best-val-macro-F1 weights in <run_dir>/best (consistent with the
 checkpointed early-stopping state across kills, and mirrored with --mirror-dir), and summary.json carries the
 gate's accounting. A run never reports success with a best/ that is not the best summary.json names.
+Phase 3 (E4): --freeze-encoder trains the decision head alone (head_only.py); the resume fingerprint carries it.
 """
 from __future__ import annotations
 
 import argparse
-import contextlib
-import json
 import os
 import statistics
 import sys
 import time
-import traceback
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 import torch
-import yaml
 from laya.common import collate_items
 
 from . import ckpt as C
 from . import export
 from .config import load_config
+from .head_only import freeze_encoder, trainable_parameters
 from .io_utils import RunLog
 from .loss import evaluate_items, forward, upstream_loss
+from .run_files import micro_timing, record_error, vram_gb, write_snapshot, write_summary
 from .sampler import bucketed_batches, padding_ratio
-from .schedule import (Settings, abs_path, build_parser, count_items, linear_warmup_lambda, load_items, micro_seed,
-                       param_groups, plan_steps, resolve_settings, sigma_for_epoch)
-
-SKIP_TIMING = 5  # first micro-steps of each process (warm-up) are excluded from the s/micro stats
-GB = 10 ** 9     # decimal GB, the unit of the doc's "<= 14 GB" cap (smoke.exit.max_vram_gb); not GiB
+from .schedule import (Settings, abs_path, build_parser, count_items, linear_warmup_lambda, load_items, load_same_run,
+                       micro_seed, param_groups, plan_steps, resolve_settings, run_fingerprint, sigma_for_epoch)
 
 
 def make_scaler(enabled: bool) -> Any:
     """fp16 loss scaler; disabled (CPU) it never skips a step and get_scale() is 1.0."""
     return torch.amp.GradScaler("cuda", enabled=enabled)
-
-
-def vram_gb(device: str) -> dict:
-    if device != "cuda":
-        return {"vram_alloc_gb": None, "vram_reserved_gb": None}
-    return {"vram_alloc_gb": round(torch.cuda.max_memory_allocated() / GB, 3),
-            "vram_reserved_gb": round(torch.cuda.max_memory_reserved() / GB, 3)}
 
 
 class Trainer:
@@ -60,6 +48,8 @@ class Trainer:
                  run_dir: Path, data_dir: Path):
         self.args, self.cfg, self.s, (self.model, self.tok, self.base_cfg) = args, cfg, s, loaded
         self.run_dir, self.data_dir, self.lc, tc = run_dir, data_dir, cfg["train"]["loss"], cfg["train"]
+        if s.head_only:
+            freeze_encoder(self.model)  # before the optimiser: param_groups leaves frozen parameters out
         self.n_items = [count_items(data_dir / f"train_e{e}.jsonl") for e in range(s.epochs)]
         self.plan = plan_steps(self.n_items, s.micro_batch, s.grad_accum, s.max_micro_steps)
         self.optimizer = torch.optim.AdamW(param_groups(self.model, tc["lr_encoder"], tc["lr_head"],
@@ -68,10 +58,7 @@ class Trainer:
             self.optimizer, linear_warmup_lambda(self.plan["total_opt"], tc["warmup_frac"]))
         self.scaler = make_scaler(s.fp16)
         self.log = RunLog(run_dir / "log.jsonl")
-        fingerprint = {"model": s.model, "seed": s.seed, "micro_batch": s.micro_batch, "grad_accum": s.grad_accum,
-                       "epochs": s.epochs, "max_micro_steps": s.max_micro_steps,
-                       "n_items_per_epoch": list(self.n_items)}
-        self.state = C.initial_state(fingerprint)
+        self.state = C.initial_state(run_fingerprint(s, self.n_items))
         self.resumed_from: tuple[str, int, int] | None = None
         self.timings: list[float] = []
         self.window: list[float] = []
@@ -87,12 +74,10 @@ class Trainer:
     def restore(self, mirror_dir: str | None) -> None:
         path = C.latest_ckpt(self.run_dir / "ckpt", mirror_dir)
         if path is not None:
-            saved = C.load_train_ckpt(path, model=self.model, optimizer=self.optimizer, scheduler=self.scheduler,
-                                      scaler=self.scaler)
-            if saved.get("fingerprint") != self.state["fingerprint"]:
-                raise ValueError(f"{path} was written with different settings ({saved.get('fingerprint')} vs "
-                                 f"{self.state['fingerprint']}); use a new --run-dir")
-            self.state = {**self.state, **saved}  # a Phase 1 checkpoint lacks the newer keys
+            saved = load_same_run(path, self.state["fingerprint"], model=self.model, optimizer=self.optimizer,
+                                  scheduler=self.scheduler, scaler=self.scaler)
+            # a Phase 1 checkpoint lacks the newer keys; an older fingerprint is carried on in today's form
+            self.state = {**self.state, **saved, "fingerprint": self.state["fingerprint"]}
             self.resumed_from = (str(path), saved["micro_step"], saved["opt_step"])
             self._prev_boundary_micro, self._committed = saved["micro_step"], saved["opt_step"]
             if self.state["bad"] >= self.cfg["train"]["patience"]:
@@ -126,8 +111,10 @@ class Trainer:
                      n_items_per_epoch=self.n_items, total_opt_steps=plan["total_opt"],
                      total_micro_steps=plan["total_micro"], padding_ratio=self.pad_ratio,
                      truncated_items=self.truncated, grad_ckpt=s.grad_ckpt, fp16=s.fp16, epochs=s.epochs,
-                     max_len=s.max_len, head_max_len=s.head_max_len, save_best=self.args.save_best)
-        print(f"start: {s.model} seed {s.seed} on {s.device}/{s.card} | MB {s.micro_batch} x ACC {s.grad_accum}"
+                     max_len=s.max_len, head_max_len=s.head_max_len, save_best=self.args.save_best,
+                     head_only=s.head_only, trainable_params=trainable_parameters(self.model))
+        print(f"start: {s.model}{' head-only' if s.head_only else ''} seed {s.seed} on {s.device}/{s.card}"
+              f" | MB {s.micro_batch} x ACC {s.grad_accum}"
               f" | {sum(self.n_items)} items | {plan['total_micro']} micro / {plan['total_opt']} opt steps"
               f" | padding {self.pad_ratio:.2f} | truncated {self.truncated}", flush=True)
         if self.resumed_from:
@@ -313,17 +300,16 @@ class Trainer:
                               batch_size=s.eval_batch_size)
 
     def summary(self, final_eval: dict | None) -> dict:
-        s, st, v, timed = self.s, self.state, vram_gb(self.s.device), self.timings[SKIP_TIMING:]
+        s, st, v = self.s, self.state, vram_gb(self.s.device)
         return {"micro_steps": st["micro_step"], "opt_steps": st["opt_step"],
                 "resumed_from": self.resumed_from[1] if self.resumed_from else None,
                 "peak_vram_alloc_gb": v["vram_alloc_gb"], "peak_vram_reserved_gb": v["vram_reserved_gb"],
-                "sec_per_micro_median": statistics.median(timed) if timed else None,
-                "sec_per_micro_mean": statistics.fmean(timed) if timed else None,
-                "nonfinite": st["nonfinite"], "min_scale": st["min_scale"], "initial_eval": st["initial_eval"],
-                "final_eval": final_eval, "n_train_items": sum(self.n_items), "truncated_items": self.truncated,
-                "padding_ratio": self.pad_ratio, "device": s.device, "card": s.card, "micro_batch": s.micro_batch,
+                **micro_timing(self.timings), "nonfinite": st["nonfinite"], "min_scale": st["min_scale"],
+                "initial_eval": st["initial_eval"], "final_eval": final_eval, "n_train_items": sum(self.n_items),
+                "truncated_items": self.truncated, "padding_ratio": self.pad_ratio, "device": s.device, "card": s.card,
+                "micro_batch": s.micro_batch,
                 "grad_accum": s.grad_accum, "model": s.model, "seed": s.seed, "epochs": s.epochs,
-                "total_opt_steps": self.plan["total_opt"], "stop_reason": self.stop_reason,
+                "head_only": s.head_only, "total_opt_steps": self.plan["total_opt"], "stop_reason": self.stop_reason,
                 "opt_steps_skipped": st["skipped"], "nonfinite_grad_applied": st["nonfinite_applied"],
                 "evals": st["evals"], "best_opt_step": st["best_opt_step"], "best_eval": st["best_eval"]}
 
@@ -341,9 +327,7 @@ class Trainer:
         if self.args.save_best:
             self._check_best()
         summary = self.summary(final_eval)
-        tmp = self.run_dir / "summary.json.tmp"
-        tmp.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-        os.replace(tmp, self.run_dir / "summary.json")
+        write_summary(self.run_dir, summary)
         if self.args.save_best:
             C.commit_best(self.run_dir)  # the run is complete: summary.json now records best/
         self.log.log(event="done", micro_steps=st["micro_step"], opt_steps=st["opt_step"], stop_reason=self.stop_reason)
@@ -382,9 +366,7 @@ def run(args: argparse.Namespace) -> dict:
     if (args.initial_eval or args.final_eval or s.eval_every_opt_steps) and not (data_dir / "val.jsonl").is_file():
         raise FileNotFoundError(f"evaluation needs {data_dir / 'val.jsonl'} (--initial/final-eval, eval_every)")
     run_dir.mkdir(parents=True, exist_ok=True)
-    snapshot = {"config": cfg, "args": vars(args), "settings": asdict(s)}
-    (run_dir / "config.yaml").write_text(yaml.safe_dump(snapshot, sort_keys=False, allow_unicode=True),
-                                         encoding="utf-8")
+    write_snapshot(run_dir, cfg, args, s)
     trainer = Trainer(args, cfg, s, export.load_for_training(args.init, cfg, s), run_dir, data_dir)
     trainer.restore(args.mirror_dir)
     trainer.log_start()
@@ -394,19 +376,12 @@ def run(args: argparse.Namespace) -> dict:
     return trainer.finish()
 
 
-def _record_error(run_dir: str, exc: BaseException) -> None:
-    path = Path(run_dir)
-    if path.is_absolute() and path.is_dir():
-        with contextlib.suppress(OSError), (path / "error.log").open("a", encoding="utf-8") as fh:
-            fh.write("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
-
-
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         run(args)
     except Exception as exc:  # one line for the notebook; the traceback goes to <run_dir>/error.log
-        _record_error(args.run_dir, exc)
+        record_error(args.run_dir, exc)
         msg = (str(exc).strip().splitlines() or [""])[0]
         print(f"train_single: {type(exc).__name__}: {msg}", file=sys.stderr, flush=True)
         return 1

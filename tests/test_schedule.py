@@ -210,7 +210,7 @@ def _opts(**kw):
     from types import SimpleNamespace
     base = dict(model="laya", seed=11, device="cpu", card="auto", micro_batch=None, effective_batch=None,
                 grad_ckpt="auto", epochs=None, max_micro_steps=None, ckpt_every_micro_steps=None,
-                ckpt_every_min=None, eval_every_opt_steps=None, keep_last=None)
+                ckpt_every_min=None, eval_every_opt_steps=None, keep_last=None, freeze_encoder=False)
     return SimpleNamespace(**(base | kw))
 
 
@@ -245,6 +245,115 @@ def test_resolve_settings_rejects_keep_last_below_one(cfg, tmp_path):
     bad_cfg = {**cfg, "train": {**cfg["train"], "keep_last": 0}}
     with pytest.raises(ValueError, match="keep.last"):
         S.resolve_settings(_opts(), bad_cfg, data)
+
+
+# ---- head-only training (E4, design §7.10 Option B): the flag and the resume fingerprint ----
+
+def test_freeze_encoder_flag_is_parsed_and_off_by_default():
+    parse = S.build_parser().parse_args
+    assert parse(["--run-dir", "/r", "--data-dir", "/d", "--freeze-encoder"]).freeze_encoder is True
+    assert parse(["--run-dir", "/r", "--data-dir", "/d"]).freeze_encoder is False
+
+
+def test_resolve_settings_carries_head_only_and_keeps_the_card_checkpointing(cfg, tmp_path):
+    from synth import write_synthetic_data_dir
+    data = write_synthetic_data_dir(tmp_path / "data", n_train=4, n_val=2)
+    assert S.resolve_settings(_opts(), cfg, data).head_only is False
+    s = S.resolve_settings(_opts(freeze_encoder=True, card="T4"), cfg, data)
+    assert s.head_only is True and s.grad_ckpt is True    # the head's checkpointing still follows the card
+    assert (s.micro_batch, s.grad_accum) == (8, 4)        # everything else as a full fine-tuning run
+
+
+def _settings(**kw):
+    base = dict(model="laya", seed=11, device="cpu", card="CPU", micro_batch=2, grad_accum=2, grad_ckpt=False,
+                fp16=False, epochs=1, max_len=512, head_max_len=192, max_micro_steps=None,
+                ckpt_every_micro_steps=None, ckpt_every_min=0.0, eval_every_opt_steps=None, keep_last=2)
+    return S.Settings(**(base | kw))
+
+
+def test_settings_default_to_full_fine_tuning():
+    assert _settings().head_only is False
+
+
+def test_run_fingerprint_holds_what_a_resume_must_share():
+    fp = S.run_fingerprint(_settings(), [64])
+    assert fp == {"model": "laya", "seed": 11, "micro_batch": 2, "grad_accum": 2, "epochs": 1,
+                  "max_micro_steps": None, "n_items_per_epoch": [64], "head_only": False}
+    assert S.run_fingerprint(_settings(head_only=True), [64])["head_only"] is True
+    # hardware and cadence may change across a resume (another card with the same batching, checkpoint timers)
+    moved = _settings(device="cuda", card="G4", grad_ckpt=True, fp16=True, keep_last=5, ckpt_every_min=15.0,
+                      ckpt_every_micro_steps=40, eval_every_opt_steps=10)
+    assert S.run_fingerprint(moved, [64]) == fp
+
+
+def test_same_run_reads_a_fingerprint_without_head_only_as_full_fine_tuning():
+    full, head = S.run_fingerprint(_settings(), [64]), S.run_fingerprint(_settings(head_only=True), [64])
+    legacy = {k: v for k, v in full.items() if k != "head_only"}   # checkpoints written before --freeze-encoder
+    assert S.same_run(full, full) and S.same_run(head, head) and S.same_run(legacy, full)
+    assert not S.same_run(head, full) and not S.same_run(full, head) and not S.same_run(legacy, head)
+    assert not S.same_run(None, full) and not S.same_run({**full, "seed": 22}, full)
+
+
+def test_check_same_run_names_only_the_settings_that_differ(tmp_path):
+    full, head = S.run_fingerprint(_settings(), [64]), S.run_fingerprint(_settings(head_only=True), [64])
+    S.check_same_run(tmp_path / "step0000002.pt", full, full)     # the same run: no error
+    with pytest.raises(ValueError, match=r"different settings.*head_only.*--run-dir") as err:
+        S.check_same_run(tmp_path / "step0000002.pt", head, full)
+    assert "micro_batch" not in str(err.value) and "step0000002.pt" in str(err.value)
+    with pytest.raises(ValueError, match="different settings"):
+        S.check_same_run(tmp_path / "step0000002.pt", None, full)
+
+
+def test_saved_fingerprint_reads_a_checkpoint_and_tolerates_unreadable_files(tmp_path):
+    fp = S.run_fingerprint(_settings(head_only=True), [64])
+    torch.save({"model": {}, "state": {"fingerprint": fp}}, tmp_path / "ok.pt")
+    assert S.saved_fingerprint(tmp_path / "ok.pt") == fp
+    torch.save({"model": {}}, tmp_path / "nostate.pt")
+    (tmp_path / "garbage.pt").write_bytes(b"not a checkpoint")
+    for name in ("nostate.pt", "garbage.pt", "missing.pt"):
+        assert S.saved_fingerprint(tmp_path / name) is None, name
+
+
+def _stack(head_only):
+    """A toy model and optimiser stack as train_single builds it, full or head-only."""
+    from laya_poc.head_only import freeze_encoder
+    torch.manual_seed(0)
+    m = _Toy()
+    if head_only:
+        freeze_encoder(m)
+    opt = torch.optim.AdamW(S.param_groups(m, 2e-5, 1e-4, 0.01))
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, S.linear_warmup_lambda(10, 0.0))
+    return dict(model=m, optimizer=opt, scheduler=sched, scaler=torch.amp.GradScaler("cuda", enabled=False))
+
+
+@pytest.mark.parametrize("saved_head_only,now_head_only", [(True, False), (False, True)])
+def test_load_same_run_names_the_freeze_setting_when_the_optimiser_cannot_load(tmp_path, saved_head_only,
+                                                                              now_head_only):
+    from laya_poc import ckpt as C
+    fp = {head: S.run_fingerprint(_settings(head_only=head), [64]) for head in (True, False)}
+    path = C.save_train_ckpt(tmp_path, **_stack(saved_head_only), state=C.initial_state(fp[saved_head_only]))
+    with pytest.raises(ValueError, match=r"different settings \(head_only: "):   # not torch's param-group error
+        S.load_same_run(path, fp[now_head_only], **_stack(now_head_only))
+
+
+def test_load_same_run_restores_a_checkpoint_of_the_same_run(tmp_path):
+    from laya_poc import ckpt as C
+    fp = S.run_fingerprint(_settings(head_only=True), [64])
+    saved = _stack(True)
+    torch.nn.init.constant_(saved["model"].scorer[1].weight, 0.5)
+    path = C.save_train_ckpt(tmp_path, **saved, state=C.initial_state(fp))
+    now = _stack(True)
+    state = S.load_same_run(path, fp, **now)
+    assert state["fingerprint"] == fp and torch.equal(now["model"].scorer[1].weight, saved["model"].scorer[1].weight)
+    with pytest.raises(ValueError, match="different settings"):              # loads, but another run's
+        S.load_same_run(path, {**fp, "seed": 22}, **_stack(True))
+
+
+def test_load_same_run_keeps_the_original_error_for_an_unreadable_checkpoint(tmp_path):
+    fp = S.run_fingerprint(_settings(), [64])
+    torch.save({"format": 1}, tmp_path / "step0000001.pt")
+    with pytest.raises(ValueError, match="not a training checkpoint"):
+        S.load_same_run(tmp_path / "step0000001.pt", fp, **_stack(False))
 
 
 def test_load_items_counts_truncated_states(en_tokenizer, tmp_path):

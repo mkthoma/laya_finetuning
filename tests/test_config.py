@@ -20,7 +20,8 @@ def test_project_root_honours_env(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("gpu,card", [("Tesla T4", "T4"), ("NVIDIA L4", "L4"), ("NVIDIA A10G", "A10"),
-                                      ("NVIDIA A10", "A10")])
+                                      ("NVIDIA A10", "A10"),
+                                      ("NVIDIA RTX PRO 6000 Blackwell Server Edition", "G4")])
 def test_card_from_gpu_name(gpu, card):
     assert C.card_from_gpu_name(gpu) == card
 
@@ -74,3 +75,9 @@ def test_load_config_from_explicit_yaml(tmp_path):
     p = tmp_path / "c.yaml"
     p.write_text(yaml.safe_dump(cfg), encoding="utf-8")
     assert C.load_config(p) == cfg
+
+
+def test_g4_profile_is_the_l4_recipe_without_grad_ckpt():
+    cfg = C.load_config(ROOT / "config.yaml")
+    assert C.accumulation(cfg, "G4") == (32, 1)
+    assert cfg["train"]["grad_ckpt"]["G4"] is False

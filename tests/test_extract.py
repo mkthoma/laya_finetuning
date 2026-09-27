@@ -344,3 +344,16 @@ def test_create_hf_secret_real_duckdb_redacts():
     rows = c.execute("SELECT name, type, secret_string FROM duckdb_secrets()").fetchall()
     assert rows[0][:2] == ("hf", "huggingface")
     assert "notARealToken" not in rows[0][2]
+
+
+def test_httpfs_connection_backs_off_on_rate_limits():
+    # A 48-core Colab host drew HTTP 429 from the Hub: the scan must retry with backoff, not fail.
+    import duckdb
+    try:
+        con = X.connect(threads=2, memory_limit="1GB", httpfs=True)
+    except duckdb.IOException as exc:  # httpfs extension not installable offline
+        pytest.skip(f"httpfs unavailable: {exc}")
+    get = lambda s: con.execute(f"SELECT current_setting('{s}')").fetchone()[0]
+    assert get("http_retries") == X.HTTP_RETRIES >= 5
+    assert get("http_retry_wait_ms") == X.HTTP_RETRY_WAIT_MS
+    assert float(get("http_retry_backoff")) == X.HTTP_RETRY_BACKOFF

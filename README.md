@@ -106,6 +106,58 @@ Open the notebook, connect with **Select Kernel → Colab → New Colab Server �
 disconnect, how to read `runs/e1/gate_report.md`, and the pending human task (trap annotation:
 `data/trap_candidates.csv` → two annotators → `python -m laya_poc.traps merge`).
 
+## Phase 3: the seed matrix on a Colab G4
+
+Design doc §6.2 Phase 3 and §5.14. Phase 2's gate passed 4/4 (`docs/results/phase2_gate_report_2026-09-26.md`), so
+every arm of the matrix now runs in one unattended session on a Colab **G4** (RTX PRO 6000 Blackwell). The arms are:
+
+- E2: `laya`, seeds 11/22/33.
+- E3: `laya_ml`, seeds 11/22/33.
+- E4: head-only `laya`.
+- E5: 7-class, both checkpoints.
+- E6: learning curve at 1k/3k/10k train rows.
+- B2: zero-shot, both checkpoints.
+
+That is 12 trained runs plus 2 zero-shot runs, about 2-3.5 h in total. `config.yaml` → `phase3` defines the matrix,
+and `python -m laya_poc.matrix {plan,run,report}` runs it. Each run goes through these stages:
+
+1. Training on the G4 profile (`--card G4`: micro-batch 32 x 1, no gradient checkpointing). A run resumes from its
+   checkpoint after a disconnect.
+2. A temperature fit on `val`.
+3. Evaluation, pre- and post-T, on every split: `val`, `test_id`, the three OOD pools, `stripped_test` and the 700 trap
+   candidates. Per-row predictions and an order-invariance check are saved with it.
+4. Cleanup: only `best/` is kept.
+5. A row in `results/runs.csv`.
+
+`matrix report` writes `results/phase3_report.md`. It contains per-arm means and ranges over seeds, ID→OOD gaps, ECE
+before and after T, the seed-variance flag, the E6 learning curve and B2. It also runs the **Phase 3 exit check**:
+every configured run must have `best/`, a temperature and `val` metrics.
+
+The notebook first rebuilds the frozen data exactly as E1 did (`--verify-frozen`). It then builds the data variants
+with `python -m laya_poc.variants {c7,subset,traps}` and re-checks CPU-vs-GPU parity on the new card for both
+checkpoints. Only after that does it run the matrix, one cell per arm.
+
+```bash
+.venv/Scripts/python tools/build_p3_notebook.py          # writes notebooks/phase3_matrix.ipynb
+.venv/Scripts/python tools/build_p3_notebook.py --with-token   # unattended: gitignored phase3_matrix.local.ipynb
+.venv/Scripts/python tools/dry_run_p3_local.py           # optional: the same cells on CPU (tiny model, tiny matrix)
+```
+
+The notebook's parts are `tools/p3_commands.py`, `p3_cells.py`, `p3_helpers.py` and `p3_md.py`. They reuse the
+Phase 1/E1 notebook infrastructure.
+
+To run it:
+
+1. Open the notebook and connect with **Select Kernel → Colab → New Colab Server → GPU → G4**. The G4 uses paid
+   compute units, so check Colab's Resources panel.
+2. Choose **Run All**.
+3. After a disconnect, re-run Step 1 and then the interrupted arm's cell. Finished runs are skipped, and an
+   interrupted run resumes.
+
+[`docs/phase3_matrix_runbook.md`](docs/phase3_matrix_runbook.md) covers step durations, disk, reading the report and
+`runs.csv`, failures, and what Phases 4-5 do with the saved predictions. Trap accuracy is computed after annotation.
+ONNX and the CPU benchmark come in Phase 5, from a `best/` copied to Drive.
+
 ## References
 
 - Design doc: [`Laya Record-Normalisation PoC.md`](Laya%20Record-Normalisation%20PoC.md). Phases 1-2 and the gate

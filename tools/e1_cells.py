@@ -23,7 +23,8 @@ from laya_poc.smoke_report import expected_resume_step
 OOM = ("CUDA OOM: add '--micro-batch', '4', '--effective-batch', '32' to cmd in Steps 8 and 9 alike (the resume "
        "refuses other settings), delete runs/e1/crash_exit.json so Step 8 starts E1 afresh, then run Steps 8 and 9 "
        "(runbook: When something fails)")
-GATED = ("401/403: accept the terms of the gated dataset foursquare/fsq-os-places on the Hub; for a different "
+GATED = ("HTTP 429 Too Many Requests is a Hugging Face rate limit: wait ~5 min and re-run this step; "
+         "401/403: accept the terms of the gated dataset foursquare/fsq-os-places on the Hub; for a different "
          "token set ASK_AGAIN = True in Step 3 and re-run it; then re-run this step")
 FROZEN_HINT = ("if the fingerprint differs from the frozen manifest, this build is not the frozen E1 data: compare "
                "the versions in data_report.json with the manifest and do not train on it (runbook)")

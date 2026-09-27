@@ -113,7 +113,7 @@ def _extract_pool(cfg: dict, args: argparse.Namespace, out: Path) -> tuple[pd.Da
     if args.smoke:
         return extract.extract_release(cfg, smoke=True, token=token, settings={"threads": EXTRACT_THREADS})
     spill = (_resolve(args.duckdb_temp) if args.duckdb_temp else out) / SPILL_SUBDIR
-    settings = {"threads": args.duckdb_threads or max(EXTRACT_THREADS, os.cpu_count() or 1),
+    settings = {"threads": args.duckdb_threads or EXTRACT_THREADS,  # not cpu_count: 48 threads drew HTTP 429s
                 "memory_limit": args.duckdb_memory or extract.auto_memory_limit(DUCKDB_RAM_FRACTION) or "4GB",
                 "temp_directory": str(spill)}
     try:

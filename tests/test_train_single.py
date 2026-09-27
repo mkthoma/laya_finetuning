@@ -112,6 +112,18 @@ def test_run_completes_with_consistent_log_and_summary(control):
     assert (control / "config.yaml").exists()
 
 
+def test_full_fine_tuning_is_the_default_and_logged_as_such(control, tiny_ckpt_dir):
+    from safetensors.torch import load_file
+    (start,) = _events(control, "start")
+    params = sum(v.numel() for k, v in load_file(str(tiny_ckpt_dir / "model.safetensors")).items()
+                 if k != "temperature")                                  # the only buffer in the state dict
+    assert start["head_only"] is False and start["trainable_params"] == params
+    assert json.loads((control / "summary.json").read_text(encoding="utf-8"))["head_only"] is False
+    fingerprint = torch.load(str(control / "ckpt" / "step0000006.pt"), map_location="cpu",
+                             weights_only=False)["state"]["fingerprint"]
+    assert fingerprint["head_only"] is False
+
+
 def test_optimizer_updates_encoder_and_head(control, tiny_ckpt_dir):
     from safetensors.torch import load_file
     before = load_file(str(tiny_ckpt_dir / "model.safetensors"))

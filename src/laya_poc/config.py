@@ -12,7 +12,7 @@ import yaml
 from .splits import SplitSpec
 
 PROJECT_ROOT_ENV = "LAYA_POC_ROOT"
-KNOWN_CARDS = ("T4", "L4", "A10")
+KNOWN_CARDS = ("T4", "L4", "A10", "G4")
 
 
 def project_root() -> Path:
@@ -49,7 +49,8 @@ def validate_config(cfg: dict[str, Any]) -> None:
             raise ValueError(f"smoke.ckpt_every_micro_steps must be a multiple of grad accumulation {acc} ({card})")
 
 
-_CARD_PATTERNS = {"T4": re.compile(r"\bT4\b"), "L4": re.compile(r"\bL4\b"), "A10": re.compile(r"\bA10G?\b")}
+_CARD_PATTERNS = {"T4": re.compile(r"\bT4\b"), "L4": re.compile(r"\bL4\b"), "A10": re.compile(r"\bA10G?\b"),
+                  "G4": re.compile(r"\bRTX PRO 6000\b")}  # Colab G4 runtime (Blackwell, 95 GB)
 
 
 def card_from_gpu_name(name: str) -> str:

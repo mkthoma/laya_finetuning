@@ -34,7 +34,7 @@ _ARCH_RE = re.compile(r"^(sm|compute)_(\d{2,3})([a-z]?)$")  # torch.cuda.get_arc
 # and ~3 GB of Hub cache. Below DISK_MIN_GB the run would die mid-training; below DISK_WARN_GB it is tight.
 DISK_MIN_GB = 20.0
 DISK_WARN_GB = 30.0
-NEW_T4_SERVER = "Remove Server, then Select Kernel > Colab > New Colab Server > GPU > T4, not Auto Connect"
+NEW_GPU_SERVER = "Remove Server, then Select Kernel > Colab > New Colab Server > GPU > {card}, not Auto Connect"
 STEP2_FIX = "re-run Step 2 (Install) and read logs/02_install_laya.log"
 Problems = tuple[list[str], list[str]]  # (errors, warnings)
 
@@ -166,7 +166,7 @@ def _gpu_problems(env: dict[str, Any], require_gpu: bool, expect_card: str | Non
     errors: list[str] = []
     warnings: list[str] = []
     if require_gpu and not env.get("cuda_available"):
-        errors.append(f"no CUDA GPU (Auto Connect gives a CPU): {NEW_T4_SERVER}")
+        errors.append(f"no CUDA GPU (Auto Connect gives a CPU): {NEW_GPU_SERVER.format(card=expect_card or 'T4')}")
     if env.get("cuda_available") and env.get("capability"):
         arch = "sm_%d%d" % tuple(env["capability"][:2])
         if not arch_supported(env["capability"], env.get("arch_list") or []):
@@ -177,7 +177,7 @@ def _gpu_problems(env: dict[str, Any], require_gpu: bool, expect_card: str | Non
                 "the server picker), or install a torch build that includes it")
     if expect_card and env.get("cuda_available") and env.get("card") != expect_card:
         warnings.append(f"got {env.get('gpu_name')} (card {env.get('card')}), expected {expect_card}; "
-                        "micro-batch, precision and the VRAM budget assume a T4")
+                        f"the run's micro-batch and VRAM budget assume a {expect_card}")
     return errors, warnings
 
 
