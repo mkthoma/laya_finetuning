@@ -23,7 +23,7 @@ from synth import write_synthetic_data_dir  # noqa: E402
 def test_tiny_matrix_end_to_end_on_cpu(cfg, tiny_ckpt_dir, tmp_path):
     work = tmp_path / "work"
     write_synthetic_data_dir(work / "data", n_train=32, n_val=16)
-    c = copy.deepcopy(cfg)
+    c = {k: v for k, v in copy.deepcopy(cfg).items() if k != "phase4"}  # Phase 3 only: `all` = the one Laya run
     c["train"]["epochs"] = 1
     c["phase3"] = {**c["phase3"], "arms": [{"id": "E2", "model": "laya", "scheme": "c10", "seeds": [11]}],
                    "zero_shot": [], "eval_splits": ["val", "test_id"],

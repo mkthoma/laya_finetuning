@@ -342,7 +342,7 @@ def trap_rows(kept: pd.DataFrame, ctx: Any, *,
             continue
         compressed += stats["compressed"]
         rows.append({**made[0], "id": f"{TRAP_SPLIT}-{len(rows):06d}", "multi": int(cand["multi"]),
-                     "pattern": cand["pattern"]})
+                     "pattern": cand["pattern"], "fsq_place_id": pid})  # joins traps to candidate predictions
     assert_no_leakage(rows, ctx.keep_fields, set(ctx.category_ids), set(ctx.category_names))
     by_pattern = {p: sum(r["pattern"] == p for r in rows) for p in pattern_names()}
     return rows, {"written": len(rows), "rejected": len(rejected), "rejected_ids": rejected,

@@ -233,7 +233,8 @@ def test_report_cli_writes_md_json_and_runs_csv_under_work(tmp_path, small_cfg, 
     assert "Phase 3 exit PASS (8/8" in capsys.readouterr().out
 
 
-def test_report_on_an_empty_matrix_fails_the_exit_check_but_renders(tmp_path, small_cfg):
+def test_report_on_an_empty_matrix_is_not_run_and_renders(tmp_path, small_cfg):
     res = build(tmp_path, small_cfg)
-    assert res["exit_check"]["verdict"] == "FAIL" and res["groups"] == [] and res["learning_curve"] == []
+    # nothing ran: NOT RUN (never PASS); passed is None, not True
+    assert res["exit_check"]["verdict"] == "NOT RUN" and res["exit_check"]["passed"] is None and res["groups"] == [] and res["learning_curve"] == []
     assert "no finished runs" in R.render_markdown(res)

@@ -1,5 +1,6 @@
-"""How one Phase 3 run is executed: the CLI commands of its steps, a subprocess runner that tees their output to
-<run>/logs/<step>.log, cleanup of the training directory and the per-step timings.
+"""How one matrix run is executed: the CLI commands of its steps, a subprocess runner that tees their output to
+<run>/logs/<step>.log, one step's skip / run / verify cycle, cleanup of the training directory and the per-step
+timings.
 
 Every step is `sys.executable -m laya_poc.<cli> ...` in its own process, as in the E1 notebook, so a CUDA error
 or an OOM in one run cannot leave the next one with a poisoned GPU context. The console only gets sparse
@@ -30,6 +31,22 @@ TICK_PRINT_SECONDS = 60.0
 TIMING_NAME = "timing.json"
 
 Runner = Callable[[Sequence[str], Path], int]
+# CLIs a stale process (e.g. from before a kernel restart) could still be running: module -> its dir under <run>
+GUARDED = {"train_single": "train", "small_encoder": "", "llm_baseline": "", "baseline_runs": ""}
+
+
+class StepFailed(RuntimeError):
+    """A step of one run failed; the message is the one line the notebook shows."""
+
+
+@dataclass(frozen=True)
+class Step:
+    name: str
+    module: str
+    args: list[str]
+    finished: Callable[[], bool]          # outputs of an earlier attempt exist: skip
+    problem: Callable[[], str | None]     # what is missing after the step (None = complete)
+    redo_hint: str = ""                   # what to delete when finished outputs are incomplete
 
 
 @dataclass(frozen=True)
@@ -38,7 +55,8 @@ class RunContext:
     cfg: dict
     run_dir: Path
     config_path: Path             # <run>/run_config.yaml: the config with labels.scheme = the run's scheme
-    init: str                     # 'hub' or an absolute Laya checkpoint dir (training init; B2's checkpoint)
+    init: str                     # 'hub' or an absolute local model dir: a Laya checkpoint (training init; B2's
+                                  # checkpoint), or the B4 encoder / B5 causal LM passed as their --init
     device: str
     card: str
     train_extra: tuple[str, ...]
@@ -145,9 +163,9 @@ def next_log(logs_dir: Path, stem: str) -> Path:
     return logs_dir / (f"{stem}.log" if n == 1 else f"{stem}_{n}.log")
 
 
-def running_trainers(train_dir: Path) -> list[int]:
-    """PIDs of train_single processes already training into train_dir (Linux /proc; [] elsewhere). After a
-    kernel restart an old trainer can outlive the kernel: a second one must never share its run dir."""
+def running_trainers(train_dir: Path, module: str = "train_single") -> list[int]:
+    """PIDs of `module` processes already writing into train_dir (Linux /proc; [] elsewhere). After a kernel
+    restart an old trainer can outlive the kernel: a second one must never share its run dir."""
     proc, me = Path("/proc"), os.getpid()
     if not proc.is_dir():
         return []
@@ -159,9 +177,42 @@ def running_trainers(train_dir: Path) -> list[int]:
             line = (p / "cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "replace")
         except OSError:
             continue
-        if f"{PACKAGE}.train_single" in line and str(train_dir) in line:
+        if f"{PACKAGE}.{module}" in line and str(train_dir) in line:
             found.append(int(p.name))
     return sorted(found)
+
+
+# ---------------------------------------------------------------- one step
+
+def _guard(step: Step, name: str, run_dir: Path) -> None:
+    if step.module not in GUARDED:
+        return
+    target = run_dir / GUARDED[step.module] if GUARDED[step.module] else run_dir
+    if pids := running_trainers(target, step.module):
+        raise StepFailed(f"{name}: {step.module} is already running on {target} (pids {pids}); wait for it or "
+                         f"kill it, then re-run")
+
+
+def execute_step(step: Step, name: str, run_dir: Path, runner: Runner) -> None:
+    """Skip a step whose outputs exist (they must be complete), else run it, time it and verify its outputs."""
+    if step.finished():
+        problem = step.problem()
+        if problem:
+            raise StepFailed(f"{name}: {step.name} finished earlier but {problem}; {step.redo_hint}")
+        print(f"  {step.name}: skip (finished earlier)", flush=True)
+        return
+    _guard(step, name, run_dir)
+    log = next_log(run_dir / "logs", step.name)
+    print(f"  {step.name}: python -m laya_poc.{step.module} (log {log})", flush=True)
+    t0 = time.monotonic()
+    rc = runner(module_cmd(step.module, step.args), log)
+    seconds = time.monotonic() - t0
+    add_timing(run_dir, step.name, seconds)
+    if rc != 0:
+        raise StepFailed(f"{name}: {step.name} failed (exit {rc}); log: {log}")
+    if problem := step.problem():
+        raise StepFailed(f"{name}: {step.name} exited 0 but {problem}; log: {log}")
+    print(f"  {step.name}: ok ({seconds:.0f} s)", flush=True)
 
 
 # ---------------------------------------------------------------- files
