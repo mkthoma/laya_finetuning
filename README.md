@@ -158,6 +158,42 @@ To run it:
 `runs.csv`, failures, and what Phases 4-5 do with the saved predictions. Trap accuracy is computed after annotation.
 ONNX and the CPU benchmark come in Phase 5, from a `best/` copied to Drive.
 
+## Phase 4: the baselines on a Colab G4
+
+Design doc §6.2 Phase 4, §5.13 and §7.10. Phase 3 passed its exit check 14/14
+(`docs/results/phase3_report_2026-09-27.md`), and B2 (zero-shot Laya) ran there. Phase 4 gives every other baseline
+predictions for every split, in the same run layout, `results/runs.csv` and report as the Laya runs (Phase 4 exit):
+
+- B1: majority class and class prior, c10 and c7 (CPU).
+- B3: char TF-IDF + logistic regression, C and T on `val`, c10 and c7 (CPU).
+- B4: fine-tuned small encoders, ModernBERT-base and mmBERT-small, seeds 11/22/33, on the same augmented epochs
+  Laya saw.
+- B5 (optional, `RUN_B5`): Qwen3-4B zero-shot, scored on evaluation subsets, as a reference only.
+
+B3 and B4 are the bars of decision criterion 1: fine-tuned Laya must beat both by at least 3 macro-F1 points on OOD.
+That is 13 runs, about 1-1.5 h on a G4. `config.yaml` → `phase4` defines the arms and pins the models. The matrix
+runs them (`python -m laya_poc.matrix run --only B1|B3|B4|B5`) into `runs/p4/<run_name>/`, dispatching each run to
+`python -m laya_poc.baseline_runs`, `small_encoder` or `llm_baseline`. `matrix report` adds the Phase 4 exit check
+(every baseline run has `preds/` for every eval split) and an early read of decision criterion 1 once the Phase 3
+runs are merged in.
+
+The notebook rebuilds the frozen data exactly as E1 did (`--verify-frozen`) and builds the c7 and trap-candidate
+variants. It then runs one cell per arm group, the report and a small archive (no weights, no FSQ rows).
+
+```bash
+.venv/Scripts/python tools/build_p4_notebook.py          # writes notebooks/phase4_baselines.ipynb
+.venv/Scripts/python tools/build_p4_notebook.py --with-token   # unattended: gitignored phase4_baselines.local.ipynb
+.venv/Scripts/python tools/dry_run_p4_local.py           # optional: the same cells on CPU (tiny stand-in models)
+```
+
+The notebook's parts are `tools/p4_commands.py`, `p4_cells.py`, `p4_helpers.py` and `p4_md.py`, on top of the
+Phase 1/E1/Phase 3 notebook infrastructure. Connect with **Select Kernel → Colab → New Colab Server → GPU → G4** and
+choose **Run All**; after a disconnect, re-run Step 1 and then the interrupted arm's cell (finished runs are skipped).
+To read decision criterion 1, unzip the Phase 3 and Phase 4 archives locally and merge them:
+`python -m laya_poc.matrix report --runs-root runs/p3_colab/runs/p3 --runs-root runs/p4_colab/runs/p4 --archived`.
+[`docs/phase4_baselines_runbook.md`](docs/phase4_baselines_runbook.md) covers the steps, durations, recovery,
+reading the report, the merge and what Phase 5 does next.
+
 ## References
 
 - Design doc: [`Laya Record-Normalisation PoC.md`](Laya%20Record-Normalisation%20PoC.md). Phases 1-2 and the gate

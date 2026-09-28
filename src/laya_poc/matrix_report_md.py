@@ -1,14 +1,17 @@
 """Markdown rendering of the Phase 3 report (matrix_report.build_report's result). Pure string building.
 
 Numbers are 4-dp values (macro-F1, ECE, rates); a group of several seeds shows `mean (min to max)`. Metrics only:
-no FSQ rows ever reach the report.
+no FSQ rows ever reach the report. With Phase 4 baselines configured or present, the report also has the
+decision criterion 1 early read and the Phase 4 exit check (matrix_decision); a Phase 3 only report is unchanged.
 """
 from __future__ import annotations
 
 from typing import Any, Sequence
 
-NO_THAI_MODELS = ("laya",)   # design §5.12 criterion 1: laya cannot read Thai; its ood_script is excluded
+from .matrix_decision import LEAD, NO_THAI_MODELS
+
 POOLS = ("ood_country", "ood_script", "ood_brand")
+LAYA = "laya"
 
 
 def fmt(x: Any, nd: int = 4) -> str:
@@ -39,7 +42,12 @@ def table(header: Sequence[str], rows: Sequence[Sequence[Any]]) -> list[str]:
 
 
 def _seeds(g: dict) -> str:
-    return "-" if g["zero_shot"] else ", ".join(str(s) for s in g["seeds"])
+    seeds = [s for s in g["seeds"] if s is not None]
+    return "-" if g["zero_shot"] or not seeds else ", ".join(str(s) for s in seeds)
+
+
+def _has_baselines(groups: Sequence[dict]) -> bool:
+    return any(g.get("kind", LAYA) != LAYA for g in groups)
 
 
 def accuracy_section(groups: Sequence[dict]) -> list[str]:
@@ -67,6 +75,9 @@ def calibration_section(groups: Sequence[dict]) -> list[str]:
              _pre_post(g, "test_id_ece_pre", "test_id_ece_post")] for g in groups]
     note = ("T: fitted on val by export_check for trained runs; the shipped temperature for zero-shot. ECE: 15 "
             "equal-width bins on answer_confidence, before and after the temperature.")
+    if _has_baselines(groups):
+        note += (" Baselines: T from calibration.json, fitted on val (B1 majority/prior: T = 1; B5 on its 500 val "
+                 "rows).")
     return ["## Calibration: T and ECE pre -> post", "", note, "",
             *table(["Group", "T", "val ECE pre -> post", "test_id ECE pre -> post"], rows), ""]
 
@@ -120,7 +131,63 @@ def runs_section(runs: Sequence[dict]) -> list[str]:
     return ["## Runs", "", *table(head, rows), ""]
 
 
+def _lead_cell(row: dict) -> str:
+    return "n/a" if row["lead"] is None else f"{100 * row['lead']:+.1f}"
+
+
+def _verdict_cell(row: dict) -> str:
+    if row["laya_ood_avg"] is None:
+        return "n/a (the arm has no macro-F1 on every pool)"
+    if row["passed"] is None:
+        return "n/a (no trained baseline of this scheme)"
+    verdict = "PASS" if row["passed"] else "FAIL"
+    return f"{verdict} (incomplete: no {' / '.join(row['missing'])} {row['scheme']})" if row["missing"] else verdict
+
+
+def _compared(row: dict) -> str:
+    return "; ".join(f"{b['label']} {fmt((b['ood_avg'] or {}).get('mean'))}" for b in row["baselines"]) or "none"
+
+
+def decision_section(rows: Sequence[dict]) -> list[str]:
+    title = "## Decision criterion 1 (early read)"
+    note = (f"Information only: Phase 5 applies the decision rule (design §5.12). Criterion 1: on OOD, a "
+            f"fine-tuned Laya checkpoint (mean over its seeds) must beat BOTH char TF-IDF+LR (B3) and the fine-tuned "
+            f"small encoder (B4) by >= {100 * LEAD:.0f} macro-F1 points, averaged over the OOD pools. `laya` excludes "
+            f"ood_script (it cannot read Thai by design) and every baseline is averaged over the same pools as the arm "
+            f"it is compared with. The best seed-mean B3/B4 group of the same scheme is the bar (a +1.5 to +3 point "
+            f"lead is the §5.12 Investigate band). Zero-shot (B2), head-only (E4) and train-subset (E6) runs are not "
+            f"candidates.")
+    if not rows:
+        return [title, "", note, "", "No fine-tuned Laya arm has finished under the runs roots of this report "
+                "(combine with the Phase 3 archive: `matrix report --runs-root <p3 runs> --runs-root <p4 runs>`).", ""]
+    head = ["Laya arm", "Seeds", "OOD pools", "Laya OOD avg", "Best trained baseline", "Its OOD avg",
+            "Lead (points)", f">= {100 * LEAD:.0f} points", "Compared (seed-mean OOD avg)"]
+    body = [[r["label"], ", ".join(str(s) for s in r["seeds"]), ", ".join(r["pools"]), fmt_stat(r["laya_ood_avg"]),
+             r["best"] or "n/a", fmt(r["best_ood_avg"]), _lead_cell(r), _verdict_cell(r), _compared(r)] for r in rows]
+    return [title, "", note, "", *table(head, body), ""]
+
+
+NOT_RUN_NOTE = ("not in these results: no run of this phase under the given runs roots (combine archives with "
+                "`matrix report --runs-root A --runs-root B --archived`)")
+
+
+def phase4_exit_section(ex: dict | None) -> list[str]:
+    if not ex:
+        return []
+    if ex["verdict"] == "NOT RUN":
+        return ["## Phase 4 exit check", "", f"Verdict: **NOT RUN**: {NOT_RUN_NOTE}.", ""]
+    rows = [[r["run_name"], r["kind"] + (" (optional)" if r["optional"] else ""), fmt(r["done"]), fmt(r["preds"]),
+             "optional: not run" if r["skipped"] else ("ok" if r["passed"] else "MISSING " + ", ".join(r["missing"]))]
+            for r in ex["runs"]]
+    skipped = f"; optional not run: {', '.join(ex['skipped_optional'])}" if ex["skipped_optional"] else ""
+    return ["## Phase 4 exit check", "", f"Criterion: {ex['criterion']}.", "",
+            f"Verdict: **{ex['verdict']}** ({ex['complete']}/{ex['total']} baseline runs complete{skipped})", "",
+            *table(["Run", "Kind", "done.json", "preds (every split)", "Result"], rows), ""]
+
+
 def exit_section(ex: dict) -> list[str]:
+    if ex["verdict"] == "NOT RUN":
+        return ["## Phase 3 exit check", "", f"Verdict: **NOT RUN**: {NOT_RUN_NOTE}.", ""]
     rows = [[r["run_name"], *(fmt(r[k]) for k in ("done", "best", "T", "val_metrics")),
              "ok" if r["passed"] else "MISSING " + ", ".join(r["missing"])] for r in ex["runs"]]
     return ["## Phase 3 exit check", "", f"Criterion: {ex['criterion']}.", "",
@@ -128,18 +195,31 @@ def exit_section(ex: dict) -> list[str]:
             *table(["Run", "done.json", "best/", "T", "val metrics", "Result"], rows), ""]
 
 
+def _intro(result: dict[str, Any], phase4: bool) -> list[str]:
+    ex, p4 = result["exit_check"], result.get("phase4_exit_check")
+    title = "# Laya PoC: Phase 3 seed matrix" + (" and Phase 4 baselines" if phase4 else "")
+    p4_line = f" Phase 4 exit check: **{p4['verdict']}** ({p4['complete']}/{p4['total']})." if p4 else ""
+    base_note = (" B1/B3/B4/B5 rows are the Phase 4 baselines (majority/prior, char TF-IDF+LR, fine-tuned small "
+                 "encoders, the optional reference LLM on evaluation subsets)." if phase4 else "")
+    return [title, "", f"Generated {result['generated_at']}; card(s) {', '.join(result['cards']) or 'n/a'}; "
+            f"{len(result['runs'])} finished of {len(result['configured'])} configured runs. "
+            f"Phase 3 exit check: **{ex['verdict']}** ({ex['complete']}/{ex['total']}).{p4_line}", "",
+            "Post-T metrics unless marked pre; groups of several seeds show `mean (min to max)` over seeds. "
+            f"B2 rows are the zero-shot hub checkpoints (shipped temperature).{base_note} Metrics only: no FSQ rows.",
+            ""]
+
+
 def render_markdown(result: dict[str, Any]) -> str:
     ex, groups = result["exit_check"], result["groups"]
-    lines = ["# Laya PoC: Phase 3 seed matrix", "",
-             f"Generated {result['generated_at']}; card(s) {', '.join(result['cards']) or 'n/a'}; "
-             f"{len(result['runs'])} finished of {len(result['configured'])} configured runs. "
-             f"Phase 3 exit check: **{ex['verdict']}** ({ex['complete']}/{ex['total']}).", "",
-             "Post-T metrics unless marked pre; groups of several seeds show `mean (min to max)` over seeds. "
-             "B2 rows are the zero-shot hub checkpoints (shipped temperature). Metrics only: no FSQ rows.", ""]
+    phase4 = bool(result.get("phase4_exit_check")) or _has_baselines(groups)
+    lines = _intro(result, phase4)
     if not groups:
-        lines += ["No finished runs yet (no finished runs under runs/p3).", ""]
+        where = ", ".join(result.get("runs_roots") or []) or "runs/p3"
+        lines += [f"No finished runs yet (no finished runs under {where}).", ""]
     else:
         lines += [*accuracy_section(groups), *gap_section(groups), *calibration_section(groups),
                   *robustness_section(groups), *variance_section(result), *curve_section(result["learning_curve"]),
+                  *(decision_section(result.get("decision_criterion_1") or []) if phase4 else []),
                   *runs_section(result["runs"])]
-    return "\n".join([*lines, *exit_section(ex)]) + "\n"
+    tail = [*exit_section(ex), *phase4_exit_section(result.get("phase4_exit_check"))]
+    return "\n".join([*lines, *tail]) + "\n"

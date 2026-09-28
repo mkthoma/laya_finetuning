@@ -287,7 +287,9 @@ def test_plan_prints_every_run_with_its_status(cfg, tmp_path, capsys):
     assert M.main(["plan", "--config", str(_write_cfg(cfg, tmp_path)), "--work", str(work)]) == 0
     out = capsys.readouterr().out
     lines = {line.split()[0]: line for line in out.splitlines() if line.startswith("fsq-")}
-    assert len(lines) == 14
+    phase3 = [n for n in lines if not n.startswith(("fsq-c10-B1", "fsq-c7-B1", "fsq-c10-B3", "fsq-c7-B3",
+                                                     "fsq-c10-B4", "fsq-c10-B5"))]
+    assert len(phase3) == 14 and len(lines) == 14 + 13  # the Phase 4 baselines follow in their own table
     assert " done" in lines["fsq-c10-E2-laya-s11"]
     assert "partial" in lines["fsq-c10-E2-laya-s22"] and "training" in lines["fsq-c10-E2-laya-s22"]
     assert "todo" in lines["fsq-c10-E3-laya_ml-s11"]

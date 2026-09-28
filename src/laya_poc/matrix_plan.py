@@ -6,6 +6,9 @@ suffix of §7.3 is dropped on purpose: a run name must stay the same across Cola
 resumes or skips its directory. Also here: which data directory each run trains and evaluates on (a missing
 variant names the command that builds it), the eval cadence of the small learning-curve subsets, and the
 status of a run directory. Pure apart from reading the files it is pointed at.
+
+A RunSpec's `kind` is `laya` for every Phase 3 run; the Phase 4 baselines (matrix_baselines) reuse RunSpec with
+their own kind and the name `fsq-{scheme}-{arm}-{model}[-s{seed}]` (e.g. fsq-c10-B1-prior, fsq-c10-B4-mmbert_small-s22).
 """
 from __future__ import annotations
 
@@ -18,6 +21,10 @@ from . import labels
 from .schedule import batching, count_items, plan_steps
 
 ZERO_SHOT_ARM = "B2"
+LAYA = "laya"                     # RunSpec.kind of every Phase 3 run (trained or zero-shot Laya)
+FIT_KINDS = ("majority", "prior", "tfidf_lr")          # Phase 4 baselines fitted on <data>/train.jsonl
+NO_TRAIN_KINDS = ("llm",)                             # evaluated only (like zero-shot)
+ORDER_INVARIANCE_KINDS = (LAYA, "tfidf_lr", "small_encoder")  # the rest skip order_invariance.json
 BASE_SCHEME = "c10"               # the scheme build_data writes to <data-root>/data
 EXTRA_DIR = "data_eval"           # `variants traps` output: splits that are not in the scheme's data dir
 EXTRA_SPLITS = ("trap_candidates",)
@@ -33,10 +40,18 @@ class RunSpec:
     subset: int | None = None
     head_only: bool = False
     zero_shot: bool = False
+    kind: str = LAYA
+    optional: bool = False
+
+    @property
+    def phase(self) -> int:
+        return 3 if self.kind == LAYA else 4
 
     @property
     def name(self) -> str:
         base = f"fsq-{self.scheme}-{self.arm}-{self.model}"
+        if self.kind != LAYA:
+            return base + (f"-s{self.seed}" if self.seed is not None else "")
         if self.zero_shot:
             return f"{base}-zs"
         return (f"{base}-s{self.seed}" + (f"-n{self.subset}" if self.subset else "")
@@ -153,7 +168,8 @@ def data_paths(spec: RunSpec, data_root: Path, eval_splits: Sequence[str]) -> Da
     """c10 -> <root>/data, c7 -> <root>/data_c7; subsets train on <root>/data_lc<N> but are evaluated on the
     full splits of their scheme; trap candidates come from <root>/data_eval."""
     evald = scheme_dir(data_root, spec.scheme)
-    train = None if spec.zero_shot else (subset_dir(data_root, spec.scheme, spec.subset) if spec.subset else evald)
+    trained = not spec.zero_shot and spec.kind not in NO_TRAIN_KINDS
+    train = (subset_dir(data_root, spec.scheme, spec.subset) if spec.subset else evald) if trained else None
     extras = tuple((s, extra_file(data_root, s, spec.scheme)) for s in eval_splits if s in EXTRA_SPLITS)
     return DataPaths(train, evald, extras)
 
@@ -171,14 +187,21 @@ def build_hint(data_root: Path, target: Path, spec: RunSpec) -> str:
     return f"python -m laya_poc.build_data --out {base} --verify-frozen"
 
 
+def train_inputs(spec: RunSpec, epochs: int) -> list[str]:
+    """The files a run trains (or fits) on: the augmented epoch files + val (Laya, B4 small encoders), the
+    clean train split (B1/B3, baselines.py's input)."""
+    if spec.kind in FIT_KINDS:
+        return ["train.jsonl"]
+    return [*(f"train_e{e}.jsonl" for e in range(epochs)), "val.jsonl"]
+
+
 def _required(spec: RunSpec, paths: DataPaths, eval_splits: Sequence[str], epochs: int) -> list[tuple[Path, Path]]:
     """(file, the directory whose build creates it) for every input the run reads."""
     extras = dict(paths.extras)
     need = [(paths.eval / f"{s}.jsonl", paths.eval) for s in eval_splits if s not in extras]
     need += [(p, p) for p in extras.values()]
     if paths.train is not None:
-        need += [(paths.train / f"train_e{e}.jsonl", paths.train) for e in range(epochs)]
-        need += [(paths.train / "val.jsonl", paths.train)]
+        need += [(paths.train / name, paths.train) for name in train_inputs(spec, epochs)]
     return need
 
 
@@ -227,9 +250,14 @@ def train_epochs(cfg: dict, over: TrainOverrides) -> int:
 
 # ---------------------------------------------------------------- status
 
-def eval_complete(run_dir: Path, splits: Sequence[str]) -> bool:
+def computes_order_invariance(spec: RunSpec) -> bool:
+    """Laya runs, B3 and B4 write order_invariance.json; B1 (no input) and B5 (subsets, reference) skip it."""
+    return spec.kind in ORDER_INVARIANCE_KINDS
+
+
+def eval_complete(run_dir: Path, splits: Sequence[str], order_invariance: bool = True) -> bool:
     return (all((run_dir / "eval" / f"{s}.json").is_file() and (run_dir / "preds" / f"{s}.jsonl").is_file()
-                for s in splits) and (run_dir / "order_invariance.json").is_file())
+                for s in splits) and (not order_invariance or (run_dir / "order_invariance.json").is_file()))
 
 
 def train_complete(run_dir: Path) -> bool:
@@ -242,9 +270,9 @@ def stage(run_dir: Path, spec: RunSpec, splits: Sequence[str]) -> str:
         return "done"
     if not run_dir.exists():
         return "todo"
-    if eval_complete(run_dir, splits):
+    if eval_complete(run_dir, splits, computes_order_invariance(spec)):
         return "evaluated"
-    if (run_dir / "export_check.json").is_file():
+    if (run_dir / "export_check.json").is_file() or (run_dir / "calibration.json").is_file():
         return "calibrated"
     if not spec.zero_shot and train_complete(run_dir):
         return "trained"

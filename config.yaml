@@ -125,6 +125,35 @@ phase3:
   evals_per_run: 12                  # small train subsets: eval every max(10, total_opt // 12) opt steps (cap 250)
   keep_after_run: [best]             # ckpt/ (~5 GB per resumable checkpoint) and final/ are deleted after each arm
 
+# Phase 4 (design §6.2 / §5.13 / §7.10): the remaining baselines, so every baseline has predictions for every split
+# (Phase 4 exit). They run through the Phase 3 matrix (same run layout, runs.csv and report). B2 (zero-shot Laya)
+# already ran in Phase 3. Hub revisions VERIFIED 2026-09-27 (all ungated; licences Apache-2.0 / MIT / Apache-2.0).
+phase4:
+  card: G4
+  arms:
+    - {id: B1, kind: majority, schemes: [c10, c7]}                  # majority + prior, CPU
+    - {id: B3, kind: tfidf_lr, schemes: [c10, c7]}                  # char TF-IDF + LR (C and T on val), CPU
+    - {id: B4, kind: small_encoder, model: modernbert_base, scheme: c10, seeds: [11, 22, 33]}
+    - {id: B4, kind: small_encoder, model: mmbert_small, scheme: c10, seeds: [11, 22, 33]}
+    - {id: B5, kind: llm, model: qwen3_4b, scheme: c10, optional: true}   # reference only (§5.13 item 6)
+  small_encoders:                    # §5.13 item 4 / §7.10 "Small encoder"
+    modernbert_base: {id: answerdotai/ModernBERT-base, revision: 8949b909ec900327062f0ebf497f51aef5e6f0c8}
+    mmbert_small: {id: jhu-clsp/mmBERT-small, revision: abc32620dd4f6ab06f5fbe905dc25f310618e09f}
+  small_encoder_train:               # §7.10: lr 3e-5, batch 32, 3 epochs, warm-up 6%, fp16, max_length 256
+    lr: 3.0e-5
+    batch_size: 32
+    epochs: 3
+    warmup_frac: 0.06
+    weight_decay: 0.01
+    max_length: 256
+    fp16: true
+  llms:
+    qwen3_4b: {id: Qwen/Qwen3-4B, revision: 1cfa9a7208912126459214e8b04321603b3df60c}
+  llm_eval:                          # §7.10 "Reference LLM": 2,000 items of test_id and each OOD pool, T on 500 val
+    subset_per_pool: 2000
+    val_for_temperature: 500
+    subset_seed: 20260925
+
 gate:                                # design §6.2 gate table; points are macro-F1 x 100
   min_over_zero_shot: 0.10
   min_over_majority: 0.20
