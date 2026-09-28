@@ -1,0 +1,315 @@
+{
+  "schema": "phase7_samples/1",
+  "generated_at": "2026-09-28T12:23:30+00:00",
+  "seed": 20260928,
+  "per_cell": 3,
+  "stripped_rows": 6,
+  "focus": "laya_ml",
+  "versus": "mmbert_small",
+  "labels": [
+    "arts",
+    "services",
+    "community",
+    "dining",
+    "event",
+    "health",
+    "outdoors",
+    "retail",
+    "sports",
+    "travel"
+  ],
+  "runs": {
+    "laya_ml": {
+      "dir": "fsq-c10-E3-laya_ml-s11",
+      "model": "laya_ml"
+    },
+    "laya": {
+      "dir": "fsq-c10-E2-laya-s11",
+      "model": "laya"
+    },
+    "mmbert_small": {
+      "dir": "fsq-c10-B4-mmbert_small-s11",
+      "model": "mmbert_small"
+    },
+    "tfidf_lr": {
+      "dir": "fsq-c10-B3-tfidf_lr",
+      "model": "tfidf_lr"
+    }
+  },
+  "splits": {
+    "test_id": {
+      "kind": "labelled",
+      "n": 3000,
+      "runs": {
+        "laya_ml": {
+          "n": 3000,
+          "answered": 3000,
+          "abstained": 0,
+          "correct": 1790,
+          "accuracy": 0.5966666666666667,
+          "judged": true
+        },
+        "laya": {
+          "n": 3000,
+          "answered": 3000,
+          "abstained": 0,
+          "correct": 1742,
+          "accuracy": 0.5806666666666667,
+          "judged": true
+        },
+        "mmbert_small": {
+          "n": 3000,
+          "answered": 3000,
+          "abstained": 0,
+          "correct": 1812,
+          "accuracy": 0.604,
+          "judged": true
+        },
+        "tfidf_lr": {
+          "n": 3000,
+          "answered": 3000,
+          "abstained": 0,
+          "correct": 1490,
+          "accuracy": 0.49666666666666665,
+          "judged": true
+        }
+      },
+      "agreement": {
+        "n": 3000,
+        "both_right": 1578,
+        "focus_only_right": 212,
+        "versus_only_right": 234,
+        "both_wrong": 976,
+        "both_wrong_same_label": 596,
+        "either_abstained": 0
+      },
+      "sampled": {
+        "both_right": 3,
+        "focus_only_right": 3,
+        "versus_only_right": 3,
+        "both_wrong": 3
+      }
+    },
+    "ood_country": {
+      "kind": "labelled",
+      "n": 1998,
+      "runs": {
+        "laya_ml": {
+          "n": 1998,
+          "answered": 1998,
+          "abstained": 0,
+          "correct": 1010,
+          "accuracy": 0.5055055055055055,
+          "judged": true
+        },
+        "laya": {
+          "n": 1998,
+          "answered": 1998,
+          "abstained": 0,
+          "correct": 913,
+          "accuracy": 0.456956956956957,
+          "judged": true
+        },
+        "mmbert_small": {
+          "n": 1998,
+          "answered": 1998,
+          "abstained": 0,
+          "correct": 1058,
+          "accuracy": 0.5295295295295295,
+          "judged": true
+        },
+        "tfidf_lr": {
+          "n": 1998,
+          "answered": 1998,
+          "abstained": 0,
+          "correct": 730,
+          "accuracy": 0.36536536536536535,
+          "judged": true
+        }
+      },
+      "agreement": {
+        "n": 1998,
+        "both_right": 855,
+        "focus_only_right": 155,
+        "versus_only_right": 203,
+        "both_wrong": 785,
+        "both_wrong_same_label": 456,
+        "either_abstained": 0
+      },
+      "sampled": {
+        "both_right": 3,
+        "focus_only_right": 3,
+        "versus_only_right": 3,
+        "both_wrong": 3
+      }
+    },
+    "ood_script": {
+      "kind": "labelled",
+      "n": 2000,
+      "runs": {
+        "laya_ml": {
+          "n": 2000,
+          "answered": 2000,
+          "abstained": 0,
+          "correct": 1082,
+          "accuracy": 0.541,
+          "judged": true
+        },
+        "laya": {
+          "n": 2000,
+          "answered": 2000,
+          "abstained": 0,
+          "correct": 648,
+          "accuracy": 0.324,
+          "judged": false
+        },
+        "mmbert_small": {
+          "n": 2000,
+          "answered": 2000,
+          "abstained": 0,
+          "correct": 1015,
+          "accuracy": 0.5075,
+          "judged": true
+        },
+        "tfidf_lr": {
+          "n": 2000,
+          "answered": 2000,
+          "abstained": 0,
+          "correct": 591,
+          "accuracy": 0.2955,
+          "judged": true
+        }
+      },
+      "agreement": {
+        "n": 2000,
+        "both_right": 837,
+        "focus_only_right": 245,
+        "versus_only_right": 178,
+        "both_wrong": 740,
+        "both_wrong_same_label": 426,
+        "either_abstained": 0
+      },
+      "sampled": {
+        "both_right": 3,
+        "focus_only_right": 3,
+        "versus_only_right": 3,
+        "both_wrong": 3
+      }
+    },
+    "ood_brand": {
+      "kind": "labelled",
+      "n": 2000,
+      "runs": {
+        "laya_ml": {
+          "n": 2000,
+          "answered": 2000,
+          "abstained": 0,
+          "correct": 1109,
+          "accuracy": 0.5545,
+          "judged": true
+        },
+        "laya": {
+          "n": 2000,
+          "answered": 2000,
+          "abstained": 0,
+          "correct": 1462,
+          "accuracy": 0.731,
+          "judged": true
+        },
+        "mmbert_small": {
+          "n": 2000,
+          "answered": 2000,
+          "abstained": 0,
+          "correct": 1272,
+          "accuracy": 0.636,
+          "judged": true
+        },
+        "tfidf_lr": {
+          "n": 2000,
+          "answered": 2000,
+          "abstained": 0,
+          "correct": 1049,
+          "accuracy": 0.5245,
+          "judged": true
+        }
+      },
+      "agreement": {
+        "n": 2000,
+        "both_right": 974,
+        "focus_only_right": 135,
+        "versus_only_right": 298,
+        "both_wrong": 593,
+        "both_wrong_same_label": 414,
+        "either_abstained": 0
+      },
+      "sampled": {
+        "both_right": 3,
+        "focus_only_right": 3,
+        "versus_only_right": 3,
+        "both_wrong": 3
+      }
+    },
+    "stripped_test": {
+      "kind": "no_evidence",
+      "n": 1000,
+      "runs": {
+        "laya_ml": {
+          "n": 1000,
+          "answered": 0,
+          "abstained": 1000,
+          "correct": 0,
+          "accuracy": null,
+          "judged": true,
+          "ungated": {
+            "answered": 1000,
+            "accuracy": 0.097,
+            "mean_confidence": 0.10222038595483583
+          }
+        },
+        "laya": {
+          "n": 1000,
+          "answered": 0,
+          "abstained": 1000,
+          "correct": 0,
+          "accuracy": null,
+          "judged": true,
+          "ungated": {
+            "answered": 1000,
+            "accuracy": 0.1,
+            "mean_confidence": 0.1002129719075363
+          }
+        },
+        "mmbert_small": {
+          "n": 1000,
+          "answered": 0,
+          "abstained": 1000,
+          "correct": 0,
+          "accuracy": null,
+          "judged": true,
+          "ungated": {
+            "answered": 1000,
+            "accuracy": 0.104,
+            "mean_confidence": 0.11264556872882263
+          }
+        },
+        "tfidf_lr": {
+          "n": 1000,
+          "answered": 0,
+          "abstained": 1000,
+          "correct": 0,
+          "accuracy": null,
+          "judged": true,
+          "ungated": {
+            "answered": 1000,
+            "accuracy": 0.084,
+            "mean_confidence": 0.4543715021318364
+          }
+        }
+      },
+      "agreement": null,
+      "sampled": {
+        "rows": 6
+      }
+    }
+  }
+}

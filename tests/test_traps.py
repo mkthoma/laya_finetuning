@@ -203,7 +203,10 @@ def test_trap_rows_follow_the_row_schema_and_prefer_pool_values(tmp_path):
     rows, stats = T.trap_rows(T.merge_annotations(path), _ctx(), pool=pool)
     assert [r["id"] for r in rows] == ["trap-000000", "trap-000001", "trap-000002", "trap-000003"]
     assert set(rows[0]) == {"id", "split", "state", "questions", "gold", "label", "country", "aug", "has_evidence",
-                            "multi", "pattern"}
+                            "multi", "pattern", "fsq_place_id"}
+    # the place id lets Phase 5 join the kept traps to every model's trap-candidate predictions
+    kept = T.merge_annotations(path)
+    assert [r["fsq_place_id"] for r in rows] == list(kept["fsq_place_id"])
     by_name = {json.loads(r["state"])["name"]: r for r in rows}
     r0, m1 = rows[0], by_name["Bank Pharmacy"]
     assert r0["split"] == "trap" and r0["label"] == "dining" and r0["aug"] == "none" and r0["multi"] == 0

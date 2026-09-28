@@ -154,6 +154,34 @@ phase4:
     val_for_temperature: 500
     subset_seed: 20260925
 
+# Phase 5 (design §6.2 / §5.11 / §5.12 / §7.9-§7.11): full evaluation from the saved predictions, the CPU/ONNX
+# benchmark, and the decision rule. Thresholds are the doc's §5.12 values, fixed before any Phase 5 result.
+phase5:
+  candidates: [E2, E3]               # fine-tuned Laya arms judged by §5.12 (3 seeds each; c10 headline)
+  report_also: [E5]                  # 7-class arms: reported, not judged (no 7-class B4)
+  # §5.13 item 4 defines B4 per language: criterion 1 compares each Laya checkpoint with the small encoder of its
+  # language (primary); the stricter "best small encoder of either language" is reported as a sensitivity check.
+  small_encoder_match: {laya: modernbert_base, laya_ml: mmbert_small}
+  lookalike_pairs: [[dining, arts], [sports, outdoors], [services, community], [retail, services]]
+  bootstrap: {resamples: 1000, ci: 0.95, seed: 20260925}   # paired item resampling, seed-mean macro-F1
+  decision:
+    lead_points: 3.0                 # criterion 1
+    max_gap_points: 5.0              # criterion 2
+    max_ece: 0.05                    # criterion 3 (test_id and the OOD average, post-T)
+    stop_ece: 0.10
+    stop_p95_ms: 1000                # stop: p95 above this even with ONNX on 8 threads
+    investigate_seed_range_points: 3.0
+    investigate_fraction_of_margin: 0.5   # "misses a single criterion by less than half its margin"
+  bench:                             # §7.11 / C1: 1k test_id, batch-1 latency, batched throughput, cold start, RAM
+    models: [laya, laya_ml, modernbert_base, mmbert_small]
+    backends: {laya: [torch, onnx], laya_ml: [torch, onnx], modernbert_base: [torch], mmbert_small: [torch]}
+    threads: [1, 2, 4, 8]            # capped at the machine's physical cores
+    latency_n: 500
+    batch_n: 1000
+    warmup: 20
+    batch_size: 32
+    onnx: {opset: 18, check_n: 1000, min_argmax_agree: 0.999, max_dp: 0.001}
+
 gate:                                # design §6.2 gate table; points are macro-F1 x 100
   min_over_zero_shot: 0.10
   min_over_majority: 0.20
